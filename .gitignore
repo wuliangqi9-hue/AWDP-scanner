@@ -1,0 +1,23 @@
+# Python 缓存
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 运行时生成的目录与文件
+.awdp_backups/
+chroma_db/
+target_code/
+awdp_pro_report.md
+
+# 本地大模型与向量模型
+models/
+
+# 环境变量与 IDE 配置
+.env
+.idea/
+.vscode/
+*.swp
+
+# 忽略补丁文件
+*.diff
+*.patch
