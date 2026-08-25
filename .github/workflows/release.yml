@@ -1,0 +1,38 @@
+name: release-artifacts
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: python -m pip install --upgrade pip build pip-audit
+      - run: python -m build
+      - run: python -m pip install dist/*.whl
+      - run: awdp-scanner --version
+      - name: Generate dependency SBOM
+        run: pip-audit . --progress-spinner off --format cyclonedx-json --output dist/awdp-scanner-sbom.cdx.json
+      - name: Generate checksums
+        run: cd dist && sha256sum * > SHA256SUMS
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-artifacts
+          path: dist/*
+      - name: Attach artifacts to GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" dist/* --verify-tag --generate-notes

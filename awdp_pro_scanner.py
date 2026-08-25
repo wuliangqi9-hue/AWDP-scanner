@@ -1,16 +1,31 @@
+import argparse
 import ast
+import ipaddress
 import json
 import os
+import platform
 import py_compile
 import re
+import shlex
 import shutil
 import subprocess
 import tempfile
 import time
+import uuid
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urlparse
 
 import requests
+
+from awdp_scanner.cache import ScanCache, project_fingerprint
+from awdp_scanner.analysis import analyze_python_project
+from awdp_scanner.discovery import DiscoveryPolicy, discover_sources
+from awdp_scanner.io import atomic_write_json, atomic_write_text as _atomic_write_text
+from awdp_scanner.models import RunSummary
+from awdp_scanner.patching import verify_patch_in_isolated_copy
+from awdp_scanner.rag import directory_content_digest, rerank_knowledge_candidates
+from awdp_scanner.reporters import write_findings_json, write_sarif
 
 try:
     from dotenv import load_dotenv
@@ -20,8 +35,9 @@ except ImportError:
 
 def _load_local_dotenv():
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    dotenv_path = os.path.join(script_dir, ".env")
-    if not os.path.isfile(dotenv_path):
+    dotenv_candidates = [os.path.join(script_dir, ".env"), os.path.join(os.getcwd(), ".env")]
+    dotenv_path = next((path for path in dotenv_candidates if os.path.isfile(path)), "")
+    if not dotenv_path:
         return False
     if load_dotenv is None:
         print("注意: 检测到 .env，但未安装 python-dotenv，当前不会自动加载该文件。")
@@ -41,6 +57,8 @@ try:
 
     HAS_RAG = True
 except ImportError:
+    Chroma = None
+    HuggingFaceEmbeddings = None
     HAS_RAG = False
 
 
@@ -50,7 +68,11 @@ except ImportError:
 def _resolve_local_path(path_value):
     if os.path.isabs(path_value):
         return path_value
-    return os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), path_value))
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    configured_workspace = os.getenv("AWDP_WORKSPACE_DIRECTORY", "").strip()
+    source_checkout = os.path.isdir(os.path.join(script_dir, "wp_knowledge"))
+    workspace = configured_workspace or (script_dir if source_checkout else os.getcwd())
+    return os.path.abspath(os.path.join(workspace, path_value))
 
 
 def _get_env_int(name, default, minimum=1):
@@ -83,13 +105,41 @@ def _get_env_csv_set(name, default=""):
     return {item.strip().lower() for item in str(raw_value or "").split(",") if item.strip()}
 
 
+def _get_env_csv_tuple(name, default=""):
+    raw_value = os.getenv(name, default)
+    return tuple(item.strip().lower() for item in str(raw_value or "").split(",") if item.strip())
+
+
 def _utc_timestamp():
     return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
 
 
+def _new_run_id():
+    return f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{uuid.uuid4().hex[:8]}"
+
+
+def _git_revision():
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=SCRIPT_DIR,
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+    return result.stdout.strip() if result.returncode == 0 else "unknown"
+
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-TARGET_DIRECTORY = os.path.join(SCRIPT_DIR, "target_code")
-DB_DIRECTORY = os.path.join(SCRIPT_DIR, "chroma_db")
+TARGET_DIRECTORY = _resolve_local_path(
+    os.getenv("AWDP_TARGET_DIRECTORY", os.getenv("TARGET_DIRECTORY", "target_code")).strip() or "target_code"
+)
+RUNS_DIRECTORY = _resolve_local_path(os.getenv("AWDP_RUNS_DIRECTORY", "awdp_runs").strip() or "awdp_runs")
+CACHE_DIRECTORY = _resolve_local_path(os.getenv("AWDP_CACHE_DIRECTORY", ".awdp_cache").strip() or ".awdp_cache")
+DB_DIRECTORY = _resolve_local_path(os.getenv("AWDP_DB_DIRECTORY", "chroma_db").strip() or "chroma_db")
 DB_META_PATH = os.path.join(DB_DIRECTORY, ".awdp_db_meta.json")
 
 EMBED_MODEL_NAME = os.getenv("AWDP_EMBED_MODEL_NAME", "all-MiniLM-L6-v2").strip() or "all-MiniLM-L6-v2"
@@ -102,32 +152,82 @@ OLLAMA_API_URL = f"{OLLAMA_BASE_URL}/api/generate"
 OLLAMA_TAGS_URL = f"{OLLAMA_BASE_URL}/api/tags"
 OLLAMA_SHOW_URL = f"{OLLAMA_BASE_URL}/api/show"
 MODEL_NAME = os.getenv("AWDP_MODEL_NAME", "qwen2.5-coder:14b").strip() or "qwen2.5-coder:14b"
+STRICT_OFFLINE = _get_env_bool("AWDP_STRICT_OFFLINE", True)
+REMOTE_MODEL_ALLOWED = False
+STATIC_ONLY = False
+FORCE_DEEP_SCAN_ALL = False
+GENERATE_REPAIRS = True
+REPAIR_MANUAL_REVIEW = True
+SCANNER_VERSION = "0.2.0"
+
+HTTP_SESSION = requests.Session()
+HTTP_SESSION.trust_env = False
+HTTP_SESSION.headers.update({"User-Agent": f"awdp-scanner/{SCANNER_VERSION}"})
 
 RAG_MODE = (os.getenv("AWDP_RAG_MODE", "repair_only").strip().lower() or "repair_only")
 if RAG_MODE not in {"off", "prejudge", "repair_only"}:
     RAG_MODE = "repair_only"
 
 RAG_DB_ROLE_EXPECTED = "repair_constraints_only"
-DETECTION_PROMPT_VERSION = "detection-v5"
+RAG_STRATEGY_VERSION_EXPECTED = "awdp-repair-only-v3-hybrid"
+KNOWLEDGE_LABEL_SCHEMA_EXPECTED = "awdp-kb-labels-v1"
+DETECTION_PROMPT_VERSION = "detection-v6-security-invariants"
 REPAIR_PROMPT_VERSION = "repair-human-v2"
 REPORT_FORMAT_VERSION = "v7"
 
+DETECTION_OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "verdict": {"type": "string", "enum": ["vulnerable", "safe", "needs_manual_review"]},
+        "vuln_type": {"type": "string"},
+        "reason": {"type": "string"},
+        "code_evidence": {"type": "string"},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+    },
+    "required": ["verdict", "vuln_type", "reason", "code_evidence", "confidence"],
+    "additionalProperties": False,
+}
+
+REPAIR_OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "report_fix_summary": {"type": "string"},
+        "vuln_location": {"type": "string"},
+        "original_code_snippet": {"type": "string"},
+        "fixed_code_snippet": {"type": "string"},
+    },
+    "required": [
+        "report_fix_summary",
+        "vuln_location",
+        "original_code_snippet",
+        "fixed_code_snippet",
+    ],
+    "additionalProperties": False,
+}
+
 MAX_WORKERS = _get_env_int("AWDP_MAX_WORKERS", 1)
+MAX_SOURCE_FILES = _get_env_int("AWDP_MAX_SOURCE_FILES", 10_000)
+MAX_SOURCE_FILE_BYTES = _get_env_int("AWDP_MAX_SOURCE_FILE_BYTES", 2 * 1024 * 1024)
+MAX_SOURCE_TOTAL_BYTES = _get_env_int("AWDP_MAX_SOURCE_TOTAL_BYTES", 128 * 1024 * 1024)
+SOURCE_ENCODINGS = _get_env_csv_tuple("AWDP_SOURCE_ENCODINGS", "utf-8-sig,gb18030")
 OLLAMA_TIMEOUT = _get_env_int("AWDP_OLLAMA_TIMEOUT", 180)
 BASE_NUM_PREDICT = _get_env_int("AWDP_OLLAMA_NUM_PREDICT", 768)
 DETECTION_NUM_PREDICT = _get_env_int("AWDP_DETECTION_NUM_PREDICT", min(512, BASE_NUM_PREDICT))
 REPAIR_NUM_PREDICT = _get_env_int("AWDP_REPAIR_NUM_PREDICT", BASE_NUM_PREDICT)
 MODEL_RETRIES = _get_env_int("AWDP_MODEL_RETRIES", 2)
+MODEL_SEED = _get_env_int("AWDP_MODEL_SEED", 42, minimum=0)
+MODEL_KEEP_ALIVE = os.getenv("AWDP_MODEL_KEEP_ALIVE", "10m").strip() or "10m"
 FULL_FILE_MODEL_CHAR_LIMIT = _get_env_int("AWDP_FULL_FILE_MODEL_CHAR_LIMIT", 6000)
 MAX_MODEL_INPUT_CHARS = _get_env_int("AWDP_MAX_MODEL_INPUT_CHARS", 9000)
 SNIPPET_CONTEXT_LINES = _get_env_int("AWDP_SNIPPET_CONTEXT_LINES", 12)
 RAG_TOP_K = _get_env_int("AWDP_RAG_TOP_K", 2)
+RAG_CANDIDATE_K = _get_env_int("AWDP_RAG_CANDIDATE_K", 12)
 RAG_SCORE_THRESHOLD = _get_env_float("AWDP_RAG_SCORE_THRESHOLD", 1.2)
 MIN_VULN_CONFIDENCE = _get_env_float("AWDP_MIN_VULN_CONFIDENCE", 0.7)
 
 ALLOWED_EXTENSIONS = {".php", ".py", ".java", ".js", ".go", ".jsp"}
 SCAN_UPLOADS = _get_env_bool("AWDP_SCAN_UPLOADS", True)
-IGNORE_DIRS = {"vendor", "node_modules", ".git", "static", "images", "__pycache__"}
+IGNORE_DIRS = {"vendor", "node_modules", ".git", "__pycache__"}
 if not SCAN_UPLOADS:
     IGNORE_DIRS.add("uploads")
 IGNORE_DIRS.update(_get_env_csv_set("AWDP_EXTRA_IGNORE_DIRS", ""))
@@ -366,6 +466,17 @@ SECONDARY_LABEL_FAMILY_MAP = {
     "目录穿越 / 文件访问": "path_traversal",
     "目录穿越 / 路径拼接": "path_traversal",
     "动态包含": "dynamic_include",
+}
+
+# A sink that cannot yet be connected to a known request source is not evidence
+# of safety. It may receive tainted data through a caller, field, framework
+# binding, or another file, so keep it in the deep-analysis queue.
+UNKNOWN_SOURCE_SINK_LABELS = set(SECONDARY_LABEL_FAMILY_MAP) | {
+    "动态执行",
+    "模板注入",
+    "疑似拼接 SQL",
+    "原始 SQL 执行",
+    "输出回显",
 }
 
 
@@ -1367,7 +1478,39 @@ def _has_any_pattern(text, patterns):
 
 
 def _strip_inline_comment(line, ext):
-    return re.sub(r"(//.*|#.*)", "", str(line or "")).strip()
+    text = str(line or "")
+    if ext == ".py":
+        markers = ("#",)
+    elif ext == ".php":
+        markers = ("//", "#")
+    elif ext in {".js", ".java", ".go", ".jsp"}:
+        markers = ("//",)
+    else:
+        markers = ("//", "#")
+
+    quote = ""
+    escaped = False
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = ""
+            index += 1
+            continue
+
+        if char in {"'", '"', "`"}:
+            quote = char
+            index += 1
+            continue
+        if any(text.startswith(marker, index) for marker in markers):
+            return text[:index].strip()
+        index += 1
+    return text.strip()
 
 
 def _get_local_context(lines, center_line_no, ext, radius=3):
@@ -1534,11 +1677,12 @@ def _relative_path(path_value):
 # ==========================================
 # 3. 元数据函数
 # ==========================================
-def load_db_metadata():
-    if not os.path.exists(DB_META_PATH):
+def load_db_metadata(db_path=DB_DIRECTORY):
+    meta_path = os.path.join(db_path, ".awdp_db_meta.json")
+    if not os.path.exists(meta_path):
         return {}
     try:
-        with open(DB_META_PATH, "r", encoding="utf-8") as meta_file:
+        with open(meta_path, "r", encoding="utf-8") as meta_file:
             loaded = json.load(meta_file)
         return loaded if isinstance(loaded, dict) else {}
     except Exception:
@@ -1578,8 +1722,6 @@ def build_local_embeddings(required=False):
             model_name=model_path,
             model_kwargs={"local_files_only": True},
         )
-    except TypeError:
-        return HuggingFaceEmbeddings(model_name=model_path)
     except Exception as exc:
         if required:
             raise RuntimeError(f"加载本地 embedding 模型失败: {exc}") from exc
@@ -1587,10 +1729,37 @@ def build_local_embeddings(required=False):
         return None
 
 
-def check_ollama_status():
+def _is_loopback_endpoint(url):
+    try:
+        parsed = urlparse(url)
+        hostname = parsed.hostname
+        if parsed.scheme not in {"http", "https"} or not hostname:
+            return False
+        if hostname.lower() == "localhost":
+            return True
+        return ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        return False
+
+
+def _model_endpoint_allowed(allow_remote_model=None):
+    if _is_loopback_endpoint(OLLAMA_BASE_URL):
+        return True, ""
+    allow_remote = REMOTE_MODEL_ALLOWED if allow_remote_model is None else bool(allow_remote_model)
+    if allow_remote:
+        return True, ""
+    mode = "严格离线模式" if STRICT_OFFLINE else "默认安全策略"
+    return False, f"{mode}拒绝非回环模型端点: {OLLAMA_BASE_URL}。如确需远端模型，请显式传入 --allow-remote-model。"
+
+
+def check_ollama_status(allow_remote_model=None):
+    endpoint_allowed, endpoint_error = _model_endpoint_allowed(allow_remote_model)
+    if not endpoint_allowed:
+        print(f"{Colors.RED}错误: {endpoint_error}{Colors.RESET}")
+        return False
     print(f"{Colors.BLUE}正在检查本地 Ollama 服务与模型状态...{Colors.RESET}")
     try:
-        response = requests.get(OLLAMA_TAGS_URL, timeout=5)
+        response = HTTP_SESSION.get(OLLAMA_TAGS_URL, timeout=5, allow_redirects=False)
     except requests.exceptions.ConnectionError:
         print(f"{Colors.RED}错误: Ollama 服务未启动或不可达，请确认 {OLLAMA_BASE_URL} 可访问。{Colors.RESET}")
         return False
@@ -1621,7 +1790,12 @@ def check_ollama_status():
         return False
 
     try:
-        show_response = requests.post(OLLAMA_SHOW_URL, json={"model": MODEL_NAME}, timeout=5)
+        show_response = HTTP_SESSION.post(
+            OLLAMA_SHOW_URL,
+            json={"model": MODEL_NAME},
+            timeout=5,
+            allow_redirects=False,
+        )
     except requests.exceptions.Timeout:
         print(f"{Colors.RED}错误: Ollama 服务可达，但模型详情检查超时: {MODEL_NAME}{Colors.RESET}")
         return False
@@ -1648,7 +1822,10 @@ def init_vector_db(db_path):
         print(f"{Colors.YELLOW}注意: 未找到向量库目录 [{db_path}]，继续执行但不使用 RAG。{Colors.RESET}")
         return None
 
-    db_meta = load_db_metadata()
+    db_meta = load_db_metadata(db_path)
+    if not db_meta:
+        print(f"{Colors.YELLOW}注意: 向量库缺少可信元数据，已禁用 RAG；请运行 build_vector_db.py 重建。{Colors.RESET}")
+        return None
     stored_embed_path = str(db_meta.get("embedding_model_path") or "").strip()
     if stored_embed_path:
         normalized_stored = os.path.normcase(os.path.abspath(_resolve_local_path(stored_embed_path)))
@@ -1659,6 +1836,14 @@ def init_vector_db(db_path):
                 f" 向量库={stored_embed_path}，当前={EMBED_MODEL_PATH}{Colors.RESET}"
             )
             return None
+    stored_embed_digest = str(db_meta.get("embedding_model_sha256") or "").strip()
+    current_embed_digest = directory_content_digest(EMBED_MODEL_PATH)
+    if len(stored_embed_digest) != 64 or stored_embed_digest != current_embed_digest:
+        print(
+            f"{Colors.YELLOW}注意: embedding 模型内容摘要缺失或与建库版本不一致，已禁用 RAG；"
+            f"请使用当前本地模型重建知识库。{Colors.RESET}"
+        )
+        return None
 
     stored_role = str(db_meta.get("knowledge_role") or "").strip()
     if stored_role and stored_role != RAG_DB_ROLE_EXPECTED:
@@ -1667,8 +1852,21 @@ def init_vector_db(db_path):
             f"`{RAG_DB_ROLE_EXPECTED}` 不一致，已禁用 RAG。{Colors.RESET}"
         )
         return None
-    if not stored_role and db_meta:
-        print(f"{Colors.YELLOW}注意: 向量库缺少 knowledge_role 元数据，建议重建后再使用。{Colors.RESET}")
+    stored_strategy = str(db_meta.get("strategy_version") or "").strip()
+    stored_label_schema = str(db_meta.get("label_schema_version") or "").strip()
+    corpus_digest = str(db_meta.get("knowledge_corpus_sha256") or "").strip()
+    if stored_strategy != RAG_STRATEGY_VERSION_EXPECTED:
+        print(
+            f"{Colors.YELLOW}注意: 向量库策略版本 `{stored_strategy or 'missing'}` 与要求的 "
+            f"`{RAG_STRATEGY_VERSION_EXPECTED}` 不一致，已禁用 RAG。{Colors.RESET}"
+        )
+        return None
+    if stored_label_schema != KNOWLEDGE_LABEL_SCHEMA_EXPECTED or len(corpus_digest) != 64:
+        print(
+            f"{Colors.YELLOW}注意: 向量库缺少受支持的标签 schema 或知识语料摘要，已禁用 RAG；"
+            f"请重建知识库。{Colors.RESET}"
+        )
+        return None
 
     embeddings = build_local_embeddings(required=False)
     if embeddings is None:
@@ -1759,6 +1957,25 @@ def extract_relevant_snippet(code_content, hit_lines):
     return snippet, "snippet", note, ", ".join(focus_parts)
 
 
+def extract_deep_all_snippet(code_content):
+    if len(code_content) <= MAX_MODEL_INPUT_CHARS:
+        return code_content, "full", "", "整文件深度审计"
+    segment_budget = max(256, (MAX_MODEL_INPUT_CHARS - 160) // 3)
+    middle_start = max(0, (len(code_content) - segment_budget) // 2)
+    segments = [
+        ("FILE_HEAD", code_content[:segment_budget]),
+        ("FILE_MIDDLE", code_content[middle_start : middle_start + segment_budget]),
+        ("FILE_TAIL", code_content[-segment_budget:]),
+    ]
+    snippet = "\n\n".join(f"[{label}]\n{text}" for label, text in segments)
+    return (
+        snippet[:MAX_MODEL_INPUT_CHARS],
+        "balanced_truncated",
+        f"文件较长（{len(code_content)} 字符），deep-all 按首部/中部/尾部均衡采样到 {MAX_MODEL_INPUT_CHARS} 字符。",
+        "首部/中部/尾部均衡深度审计",
+    )
+
+
 def _match_any_patterns(code_content, patterns, ext=""):
     if not ext:
         return any(pattern.search(code_content) for pattern in patterns or [])
@@ -1804,7 +2021,56 @@ def build_project_context(file_records):
             "identifiers": identifiers,
             "has_highly_polluted_source": bool(set(identifiers).intersection(context["highly_polluted_identifiers"])),
         }
+    semantic_analysis = analyze_python_project(file_records)
+    content_by_path = {os.path.abspath(path): content for path, content in file_records}
+    semantic_file_context = {}
+    for file_path, semantic_data in semantic_analysis.get("per_file", {}).items():
+        absolute_file_path = os.path.abspath(file_path)
+        configuration_flows = [
+            flow
+            for flow in semantic_analysis.get("configuration_flows", [])
+            if os.path.abspath(str(flow.get("sink_file", ""))) == absolute_file_path
+            or any(os.path.abspath(str(source.get("file", ""))) == absolute_file_path for source in flow.get("sources", []))
+            or any(os.path.abspath(str(step.get("file", ""))) == absolute_file_path for step in flow.get("trace", []))
+        ]
+        evidence_blocks = []
+        for flow in semantic_data.get("flows", [])[:6]:
+            source_labels = ", ".join(
+                f"{os.path.basename(source['file'])}:{source['line']} ({source['name']})"
+                for source in flow.get("sources", [])
+            )
+            chain = " -> ".join(flow.get("call_chain", []))
+            header = (
+                f"family={flow.get('family', '')}; source={source_labels or 'unknown'}; "
+                f"sink={os.path.basename(flow.get('sink_file', ''))}:{flow.get('sink_line', 0)} "
+                f"{flow.get('sink', '')}; chain={chain or 'direct'}"
+            )
+            code_lines = []
+            for location in flow.get("slice", []):
+                source_path = os.path.abspath(str(location.get("file", "")))
+                line_no = int(location.get("line", 0) or 0)
+                source_lines = content_by_path.get(source_path, "").splitlines()
+                if 1 <= line_no <= len(source_lines):
+                    code_lines.append(
+                        f"{os.path.basename(source_path)}:{line_no}: {source_lines[line_no - 1].strip()}"
+                    )
+            evidence_blocks.append(header + ("\n" + "\n".join(code_lines) if code_lines else ""))
+        semantic_file_context[os.path.abspath(file_path)] = {
+            **semantic_data,
+            "configuration_flows": configuration_flows,
+            "evidence": "\n\n".join(evidence_blocks),
+        }
+    context["semantic_analysis"] = semantic_analysis
+    context["semantic_file_context"] = semantic_file_context
     return context
+
+
+def _get_semantic_file_context(project_context, file_path):
+    semantic_files = ((project_context or {}).get("semantic_file_context", {}) or {})
+    return semantic_files.get(
+        os.path.abspath(file_path),
+        {"flows": [], "configuration_flows": [], "slice_lines": [], "evidence": ""},
+    )
 
 
 def _check_highly_polluted_source(code_content, lang_ctx, project_context, file_path):
@@ -1913,6 +2179,8 @@ def run_heuristic_prescreen(code_content, file_path="", project_context=None):
     is_source_highly_polluted = _check_highly_polluted_source(code_content, lang_ctx, project_context, file_path) if file_path else False
     lines = code_content.splitlines()
     hard_override_hits = []
+    semantic_context = _get_semantic_file_context(project_context, file_path) if file_path else {}
+    semantic_flows = list(semantic_context.get("flows", []) or [])
 
     for rule in HARD_OVERRIDE_RULES.get(ext, []):
         family = _normalize_override_family(rule.get("family", ""))
@@ -1972,6 +2240,9 @@ def run_heuristic_prescreen(code_content, file_path="", project_context=None):
             reason_parts.append(f"hard override 家族: {family_labels}")
     if is_source_highly_polluted:
         reason_parts.append("输入源被标记为高污染上下文")
+    if semantic_flows:
+        semantic_families = sorted({flow.get("family", "") for flow in semantic_flows if flow.get("family")})
+        reason_parts.append("AST 跨函数 source→sink: " + ", ".join(semantic_families))
 
     dominant_family = _mode_nonempty([hit.get("family", "") for hit in hard_override_hits])
     dominant_reason = _mode_nonempty([hit.get("override_reason", "") for hit in hard_override_hits])
@@ -1981,10 +2252,17 @@ def run_heuristic_prescreen(code_content, file_path="", project_context=None):
         "hard_override_family": dominant_family,
         "hard_override_reason": dominant_reason,
         "is_source_highly_polluted": is_source_highly_polluted,
-        "force_deep_scan": bool(hard_override_hits or is_source_highly_polluted),
-        "line_numbers": sorted({hit["line_no"] for hit in hard_override_hits}),
+        "force_deep_scan": bool(hard_override_hits or is_source_highly_polluted or semantic_flows),
+        "line_numbers": sorted(
+            {hit["line_no"] for hit in hard_override_hits}
+            | {int(line) for line in semantic_context.get("slice_lines", []) if int(line) > 0}
+        ),
         "hits": hard_override_hits,
         "reason": "；".join(reason_parts),
+        "semantic_backend": ((project_context or {}).get("semantic_analysis", {}) or {}).get("backend", ""),
+        "semantic_flows": semantic_flows,
+        "configuration_flows": list(semantic_context.get("configuration_flows", []) or []),
+        "semantic_evidence": semantic_context.get("evidence", ""),
     }
 
 
@@ -1998,6 +2276,7 @@ def build_scan_plan(file_path, code_content, project_context=None, heuristic_met
     boundary_ctx = _collect_boundary_combo_context(ext, code_content)
     write_chain_ctx = _collect_write_chain_context(ext, code_content)
     hard_sink_ctx = _collect_hard_sink_context(ext, code_content, lang_ctx, is_source_highly_polluted=is_source_highly_polluted)
+    unknown_source_sink_hits = sorted(set(lang_ctx.get("pattern_hits", [])).intersection(UNKNOWN_SOURCE_SINK_LABELS))
 
     evidence_parts = []
     if lang_ctx["input_hits"]:
@@ -2017,6 +2296,21 @@ def build_scan_plan(file_path, code_content, project_context=None, heuristic_met
     if heuristic_meta.get("hard_override"):
         family_label = VULN_FAMILY_LABELS.get(heuristic_meta.get("hard_override_family", ""), heuristic_meta.get("hard_override_family", ""))
         evidence_parts.append(_join_notes("前置启发式: 命中未受保护的高危 Sink", family_label))
+    if unknown_source_sink_hits and not lang_ctx.get("has_input"):
+        evidence_parts.append("来源未知的高危汇点: " + ", ".join(unknown_source_sink_hits[:5]))
+    if heuristic_meta.get("semantic_flows"):
+        evidence_parts.append(
+            "静态语义分析确认跨函数 source→sink: "
+            + ", ".join(
+                sorted(
+                    {
+                        flow.get("family", "")
+                        for flow in heuristic_meta.get("semantic_flows", [])
+                        if flow.get("family")
+                    }
+                )
+            )
+        )
 
     candidate = False
     if ext in {".py", ".php"}:
@@ -2048,13 +2342,15 @@ def build_scan_plan(file_path, code_content, project_context=None, heuristic_met
         candidate = True
     if not candidate and heuristic_meta.get("force_deep_scan"):
         candidate = True
+    if not candidate and unknown_source_sink_hits:
+        candidate = True
 
     if not candidate:
         note = "仅预筛: 未发现稳定的“输入源 + 风险汇点”组合，未调用模型。"
         if len(code_content) > FULL_FILE_MODEL_CHAR_LIMIT:
             note = f"仅预筛: 文件较长（{len(code_content)} 字符），且预筛未命中高风险候选，为保护本地模型未送入 Ollama。"
         return {
-            "status": "prescreen_only",
+            "status": "no_candidate",
             "lang_ctx": lang_ctx,
             "reason": _short_text("；".join(evidence_parts) or "未命中候选规则。"),
             "snippet": "",
@@ -2065,10 +2361,19 @@ def build_scan_plan(file_path, code_content, project_context=None, heuristic_met
             "is_source_highly_polluted": is_source_highly_polluted,
             "polluted_source_flag": "是" if is_source_highly_polluted else "否",
             "hard_override_family": heuristic_meta.get("hard_override_family", ""),
+            "configuration_flows": heuristic_meta.get("configuration_flows", []),
+            "unknown_source_sink": False,
         }
 
     candidate_lines = sorted(set(lang_ctx["hit_lines"] + hard_sink_ctx.get("line_numbers", []) + heuristic_meta.get("line_numbers", [])))
     snippet, snippet_mode, snippet_note, focus = extract_relevant_snippet(code_content, candidate_lines)
+    semantic_evidence = str(heuristic_meta.get("semantic_evidence", "") or "").strip()
+    if semantic_evidence:
+        semantic_section = "\n\n[AST 跨函数语义切片]\n" + semantic_evidence
+        remaining = max(0, MAX_MODEL_INPUT_CHARS - len(snippet))
+        if remaining:
+            snippet += semantic_section[:remaining]
+        snippet_mode = "semantic_slice" if snippet_mode == "snippet" else f"{snippet_mode}+semantic_slice"
     return {
         "status": "candidate",
         "lang_ctx": lang_ctx,
@@ -2085,6 +2390,11 @@ def build_scan_plan(file_path, code_content, project_context=None, heuristic_met
         "is_source_highly_polluted": is_source_highly_polluted,
         "polluted_source_flag": "是" if is_source_highly_polluted else "否",
         "hard_override_family": heuristic_meta.get("hard_override_family", ""),
+        "unknown_source_sink": bool(unknown_source_sink_hits and not lang_ctx.get("has_input")),
+        "semantic_backend": heuristic_meta.get("semantic_backend", ""),
+        "semantic_flows": heuristic_meta.get("semantic_flows", []),
+        "configuration_flows": heuristic_meta.get("configuration_flows", []),
+        "semantic_evidence": semantic_evidence,
     }
 
 
@@ -2210,7 +2520,7 @@ REPAIR_MAINLINE_HINTS = {
     "hardening": "优先使用框架安全 API，收敛动态执行和危险反射，不改变路由与返回结构。",
 }
 
- 
+
 
 
 def normalize_vuln_family(raw_value):
@@ -2224,7 +2534,7 @@ def normalize_vuln_family(raw_value):
         "file_write": ["file write", "文件写入", "write file", "file_put_contents", "writefile", "overwrite"],
         "ssti": ["ssti", "template injection", "jinja", "twig", "freemarker", "render_template_string", "模板注入", "拼模板"],
         "command_exec": ["command", "rce", "exec", "shell", "eval", "命令执行", "代码执行"],
-        "auth": ["jwt", "session", "auth", "鉴权", "认证", "越权", "权限"],
+        "auth": ["jwt", "session", "auth", "token", "鉴权", "认证", "越权", "权限"],
         "proto_pollution": ["prototype", "proto", "污染"],
         "ssrf": ["ssrf", "server-side request", "内网请求"],
         "xss": ["xss", "cross site", "脚本"],
@@ -2256,6 +2566,7 @@ def _default_knowledge_result():
         "files": [],
         "note": "",
         "context": "",
+        "retrieval_trace": [],
     }
 
 
@@ -2338,20 +2649,38 @@ def search_knowledge_base(vector_db, plan, detection_result=None, phase="repair"
         return result
 
     top_k = max(1, RAG_TOP_K)
+    candidate_k = max(top_k, RAG_CANDIDATE_K)
     try:
-        docs_with_scores = vector_db.similarity_search_with_score(query, k=top_k)
+        docs_with_scores = vector_db.similarity_search_with_score(query, k=candidate_k)
     except Exception as exc:
         result["note"] = f"知识库检索失败: {exc}"
         return result
 
-    matched_docs = sorted(
-        [
-            (doc, score, os.path.basename(str((doc.metadata or {}).get("source", ""))))
-            for doc, score in docs_with_scores
-            if score <= RAG_SCORE_THRESHOLD
-        ],
-        key=lambda item: item[1],
-    )[:top_k]
+    desired_family = normalize_vuln_family(detection_result.get("vuln_type", ""))
+    if not desired_family:
+        semantic_flows = plan.get("semantic_flows", []) or []
+        desired_family = str((semantic_flows[0] if semantic_flows else {}).get("family", "") or "")
+    if not desired_family:
+        desired_family = str(plan.get("hard_override_family", "") or "")
+    language_name = str((plan.get("lang_ctx", {}) or {}).get("lang_name", "") or "").lower()
+    language_aliases = {
+        "javascript / node": "node",
+        "javascript": "node",
+        "python": "python",
+        "php": "php",
+        "java / jsp": "java",
+        "java": "java",
+        "go": "go",
+    }
+    language = language_aliases.get(language_name, language_name.split(" ", 1)[0])
+    matched_docs = rerank_knowledge_candidates(
+        docs_with_scores,
+        query=query,
+        desired_family=desired_family,
+        language=language,
+        top_k=top_k,
+        distance_threshold=RAG_SCORE_THRESHOLD,
+    )
 
     if not matched_docs:
         result["note"] = "未检索到匹配的修复约束文档。"
@@ -2360,11 +2689,29 @@ def search_knowledge_base(vector_db, plan, detection_result=None, phase="repair"
 
     snippets = []
     files = []
-    for doc, score, source in matched_docs[:top_k]:
+    retrieval_trace = []
+    for ranked in matched_docs[:top_k]:
+        doc = ranked.document
+        source = ranked.source
         if source and source not in files:
             files.append(source)
         page_content = _short_text(getattr(doc, "page_content", ""), limit=900)
-        snippets.append(f"[{source or 'knowledge'} | score={score:.3f}]\n{page_content}")
+        snippets.append(
+            f"[{source or 'knowledge'} | hybrid={ranked.hybrid_score:.3f} | "
+            f"dense_distance={ranked.dense_distance:.3f}]\n{page_content}"
+        )
+        metadata = dict(getattr(doc, "metadata", {}) or {})
+        retrieval_trace.append(
+            {
+                "source": source,
+                "chunk_id": metadata.get("chunk_id", ""),
+                "families": metadata.get("families", ""),
+                "languages": metadata.get("languages", ""),
+                "dense_distance": ranked.dense_distance,
+                "hybrid_score": ranked.hybrid_score,
+                "components": dict(ranked.components),
+            }
+        )
 
     stage = "判定前实验" if phase == "prejudge" else "修复约束/修复复核"
     result.update(
@@ -2378,6 +2725,7 @@ def search_knowledge_base(vector_db, plan, detection_result=None, phase="repair"
                 "【本地知识库只用于修复约束与修复复核，不可作为漏洞判定证据】\n"
                 + "\n\n".join(snippets)
             ),
+            "retrieval_trace": retrieval_trace,
         }
     )
     return result
@@ -2388,6 +2736,7 @@ def build_detection_prompt(file_path, plan, prejudge_knowledge=None):
     knowledge_text = ""
     boundary_text = ""
     pollution_text = ""
+    semantic_text = ""
     if prejudge_knowledge and prejudge_knowledge.get("used"):
         knowledge_text = (
             "\n[实验信息]\n"
@@ -2404,6 +2753,13 @@ def build_detection_prompt(file_path, plan, prejudge_knowledge=None):
             "\n[跨文件上下文提醒]\n"
             "该文件关联全局高危污染源，当前文件即使表面较干净，也要关注是否只是把不可信输入继续传递到后续路径/加载/写入逻辑。\n"
         )
+    if plan.get("semantic_flows"):
+        semantic_text = (
+            "\n[静态语义分析]\n"
+            f"后端: {plan.get('semantic_backend', 'unknown')}\n"
+            "已确认项目内存在 source→调用链→sink 的数据依赖。请核对切片与代码语义；"
+            "不得仅因模型直觉将其判为 safe。\n"
+        )
 
     return f"""
 你是 AWDP 防守场景中的本地代码审计助手。你的职责是做“检测层”判断，而不是给攻击建议。
@@ -2413,6 +2769,17 @@ def build_detection_prompt(file_path, plan, prejudge_knowledge=None):
 2. 不要把知识库、模板经验、漏洞名字本身，当作“代码一定有洞”的证据。
 3. 只输出一个 JSON 对象，不要输出 Markdown，不要输出解释性前后缀。
 4. 不要输出修复代码，不要输出 Break，不要整文件重写。
+5. code_evidence 必须引用本文件真实存在的标识符、字段名、函数或 API；严禁编造 subprocess、eval、SQL 调用等不存在的证据。
+
+[强制安全不变量检查]
+在给出 verdict 前逐项核对，但不要输出思维过程：
+1. 不可信输入能否到达代码执行、命令、反序列化、文件、模板、上传、XML、URL 请求或数据库查询等安全敏感资产。
+2. SQL 与 NoSQL 都要检查；JSON 解析只改变数据格式，不会自动阻止 Mongo 操作符/对象注入。
+3. 检查认证、授权、IDOR、mass assignment：role、position、admin、privileged 等权限字段是否可由普通用户修改或间接控制。
+4. 检查客户端可知的 JWT/HMAC 密钥、自定义加密/MAC 覆盖范围、可预测或可重放会话；“完成了解码/验签调用”不等于密钥与授权设计安全。
+5. 不能因为代码中没有 os、eval、shell 或经典危险函数就判定 safe；业务逻辑与密码协议缺陷同样属于漏洞。
+6. 若上下文不足以证明 source→敏感资产或违反安全不变量，输出 needs_manual_review，不要虚构缺失代码。
+7. 区分远程请求输入与部署配置：仅由 sys.argv/环境变量提供的启动文件路径，在没有远程写入链时不是 Web 路径穿越；优先报告比赛远程攻击面对应的根因。
 
 [目标文件]
 {file_path}
@@ -2435,6 +2802,7 @@ def build_detection_prompt(file_path, plan, prejudge_knowledge=None):
 ```
 {boundary_text}
 {pollution_text}
+{semantic_text}
 {knowledge_text}
 [输出字段]
 verdict: vulnerable | safe | needs_manual_review
@@ -2445,27 +2813,119 @@ confidence: 0~1
 """
 
 
-def call_ollama(prompt, num_predict, retries=MODEL_RETRIES):
+def _payload_matches_schema(payload, schema):
+    if not isinstance(payload, dict):
+        return False
+    properties = schema.get("properties", {})
+    required = set(schema.get("required", []))
+    if not required.issubset(payload):
+        return False
+    if schema.get("additionalProperties") is False and set(payload) - set(properties):
+        return False
+    type_map = {"string": str, "number": (int, float), "object": dict, "array": list, "boolean": bool}
+    for key, value in payload.items():
+        property_schema = properties.get(key, {})
+        expected_type = property_schema.get("type")
+        expected_python_type = type_map.get(expected_type)
+        if expected_python_type and not isinstance(value, expected_python_type):
+            return False
+        if expected_type == "number" and isinstance(value, bool):
+            return False
+        if "enum" in property_schema and value not in property_schema["enum"]:
+            return False
+        if expected_type == "number":
+            if "minimum" in property_schema and value < property_schema["minimum"]:
+                return False
+            if "maximum" in property_schema and value > property_schema["maximum"]:
+                return False
+    return True
+
+
+def _ollama_duration_ms(value):
+    try:
+        return round(max(0, int(value or 0)) / 1_000_000, 3)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _ollama_rate(count, duration):
+    try:
+        count_value = max(0, int(count or 0))
+        duration_seconds = max(0, int(duration or 0)) / 1_000_000_000
+    except (TypeError, ValueError):
+        return 0.0
+    return round(count_value / duration_seconds, 3) if duration_seconds else 0.0
+
+
+def _ollama_telemetry(data=None, *, attempts=0, wall_duration_ms=0.0):
+    data = data if isinstance(data, dict) else {}
+    return {
+        "model": MODEL_NAME,
+        "attempts": max(0, int(attempts or 0)),
+        "wall_duration_ms": round(max(0.0, float(wall_duration_ms or 0.0)), 3),
+        "total_duration_ms": _ollama_duration_ms(data.get("total_duration")),
+        "load_duration_ms": _ollama_duration_ms(data.get("load_duration")),
+        "prompt_eval_count": max(0, int(data.get("prompt_eval_count", 0) or 0)),
+        "prompt_eval_duration_ms": _ollama_duration_ms(data.get("prompt_eval_duration")),
+        "prompt_tokens_per_second": _ollama_rate(
+            data.get("prompt_eval_count"), data.get("prompt_eval_duration")
+        ),
+        "eval_count": max(0, int(data.get("eval_count", 0) or 0)),
+        "eval_duration_ms": _ollama_duration_ms(data.get("eval_duration")),
+        "eval_tokens_per_second": _ollama_rate(data.get("eval_count"), data.get("eval_duration")),
+        "done_reason": str(data.get("done_reason", "") or ""),
+    }
+
+
+def call_ollama(prompt, num_predict, retries=MODEL_RETRIES, output_schema=None):
+    endpoint_allowed, endpoint_error = _model_endpoint_allowed()
+    if not endpoint_allowed:
+        return {
+            "ok": False,
+            "text": "",
+            "error": endpoint_error,
+            "telemetry": {**_ollama_telemetry(), "ok": False},
+        }
     payload = {
         "model": MODEL_NAME,
         "prompt": prompt,
-        "format": "json",
+        "format": output_schema or "json",
         "stream": False,
+        "keep_alive": MODEL_KEEP_ALIVE,
         "options": {
             "temperature": 0.0,
+            "seed": MODEL_SEED,
             "num_predict": num_predict,
         },
     }
 
     last_error = ""
+    overall_started = time.perf_counter()
     for attempt in range(1, retries + 1):
         try:
-            response = requests.post(OLLAMA_API_URL, json=payload, timeout=OLLAMA_TIMEOUT)
+            response = HTTP_SESSION.post(
+                OLLAMA_API_URL,
+                json=payload,
+                timeout=OLLAMA_TIMEOUT,
+                allow_redirects=False,
+            )
             response.raise_for_status()
             data = response.json()
             text = str(data.get("response", "")).strip()
             if text:
-                return {"ok": True, "text": text, "error": ""}
+                return {
+                    "ok": True,
+                    "text": text,
+                    "error": "",
+                    "telemetry": {
+                        **_ollama_telemetry(
+                            data,
+                            attempts=attempt,
+                            wall_duration_ms=(time.perf_counter() - overall_started) * 1000,
+                        ),
+                        "ok": True,
+                    },
+                }
             last_error = "Ollama 返回空响应。"
         except requests.exceptions.Timeout:
             last_error = f"Ollama 请求超时（第 {attempt}/{retries} 次）。"
@@ -2474,17 +2934,28 @@ def call_ollama(prompt, num_predict, retries=MODEL_RETRIES):
         except ValueError:
             last_error = "Ollama 返回了无效 JSON。"
         time.sleep(min(attempt, 2))
-    return {"ok": False, "text": "", "error": last_error or "Ollama 调用失败。"}
+    return {
+        "ok": False,
+        "text": "",
+        "error": last_error or "Ollama 调用失败。",
+        "telemetry": {
+            **_ollama_telemetry(
+                attempts=retries,
+                wall_duration_ms=(time.perf_counter() - overall_started) * 1000,
+            ),
+            "ok": False,
+        },
+    }
 
 
 def parse_detection_output(raw_text):
     parsed = _extract_json_object(raw_text)
-    if not parsed:
+    if not _payload_matches_schema(parsed, DETECTION_OUTPUT_SCHEMA):
         return {
             "verdict": "needs_manual_review",
             "vuln_type": "",
-            "reason": _short_text(raw_text or "模型输出无法解析为 JSON。", limit=260),
-            "code_evidence": "模型输出格式异常，建议人工复核。",
+            "reason": "模型输出未通过 detection JSON Schema 校验，已按失败安全策略转人工复核。",
+            "code_evidence": _short_text(raw_text or "模型输出为空。", limit=260),
             "confidence": 0.0,
         }
 
@@ -2498,12 +2969,142 @@ def parse_detection_output(raw_text):
     }
 
 
+EVIDENCE_GROUNDING_APIS = (
+    ("subprocess", re.compile(r"\bsubprocess(?:\.[A-Za-z_]\w*)?\b", re.I), re.compile(r"\bsubprocess\b", re.I)),
+    ("os.system", re.compile(r"\bos\.system\b", re.I), re.compile(r"\bos\.system\s*\(", re.I)),
+    ("os.popen", re.compile(r"\bos\.popen\b", re.I), re.compile(r"\bos\.popen\s*\(", re.I)),
+    ("pickle.loads", re.compile(r"\bpickle\.loads?\b", re.I), re.compile(r"\bpickle\.loads?\s*\(", re.I)),
+    ("yaml.load", re.compile(r"\byaml\.(?:unsafe_)?load\b", re.I), re.compile(r"\byaml\.(?:unsafe_)?load\s*\(", re.I)),
+    ("eval", re.compile(r"(?<![\w.])eval\s*\(", re.I), re.compile(r"(?<![\w.])eval\s*\(", re.I)),
+    ("exec", re.compile(r"(?<![\w.])exec\s*\(", re.I), re.compile(r"(?<![\w.])exec\s*\(", re.I)),
+    ("child_process", re.compile(r"\bchild_process(?:\.exec)?\b", re.I), re.compile(r"\bchild_process\b", re.I)),
+    ("shell_exec", re.compile(r"\bshell_exec\b", re.I), re.compile(r"\bshell_exec\s*\(", re.I)),
+    ("move_uploaded_file", re.compile(r"\bmove_uploaded_file\b", re.I), re.compile(r"\bmove_uploaded_file\s*\(", re.I)),
+    ("curl_exec", re.compile(r"\bcurl_exec\b", re.I), re.compile(r"\bcurl_exec\s*\(", re.I)),
+    ("loadXML", re.compile(r"\bloadXML\b", re.I), re.compile(r"\bloadXML\s*\(", re.I)),
+    ("jwt.decode", re.compile(r"\bjwt\.decode\b", re.I), re.compile(r"\bjwt\.decode\s*\(", re.I)),
+    (
+        "command-execution API",
+        re.compile(r"\b(?:command injection|shell commands?|execute(?:s|d|ing)? (?:a )?commands?)\b", re.I),
+        re.compile(
+            r"\bsubprocess\b|\bchild_process\b|Runtime\.getRuntime\s*\(|"
+            r"\b(?:os\.system|os\.popen|shell_exec|passthru|popen|system|exec)\s*\(",
+            re.I,
+        ),
+    ),
+    (
+        "database-query API",
+        re.compile(r"\b(?:SQL injection|NoSQL injection|database quer(?:y|ies)|SQL quer(?:y|ies))\b", re.I),
+        re.compile(
+            r"\b(?:select|insert|update|delete)\b|\b(?:execute|executemany|executescript|query|find|find_one)\s*\(",
+            re.I,
+        ),
+    ),
+)
+
+
+def _ground_detection_evidence(code_content, detection_result):
+    if detection_result.get("verdict") != "vulnerable":
+        return detection_result, {"status": "not_applicable", "unsupported_claims": []}
+    evidence = "\n".join(
+        [
+            str(detection_result.get("code_evidence", "") or ""),
+            str(detection_result.get("reason", "") or ""),
+        ]
+    )
+    unsupported = [
+        label
+        for label, claim_pattern, code_pattern in EVIDENCE_GROUNDING_APIS
+        if claim_pattern.search(evidence) and not code_pattern.search(code_content)
+    ]
+    if not unsupported:
+        return detection_result, {"status": "passed", "unsupported_claims": []}
+
+    grounded = dict(detection_result)
+    original_type = str(detection_result.get("vuln_type", "") or "")
+    grounded.update(
+        {
+            "verdict": "needs_manual_review",
+            "vuln_type": "",
+            "reason": _join_notes(
+                "模型给出了无法在目标文件中落地的关键 API 证据，不能据此确认漏洞。",
+                "未找到: " + ", ".join(unsupported),
+                f"模型原始类型: {original_type}" if original_type else "",
+            ),
+            "code_evidence": "未在目标文件中找到模型声称的 API: " + ", ".join(unsupported),
+            "confidence": 0.0,
+            "ungrounded_claims": unsupported,
+        }
+    )
+    return grounded, {"status": "failed", "unsupported_claims": unsupported}
+
+
 def _apply_hard_override(file_path, code_content, plan, detection_result, heuristic_meta=None):
     # 后置 hard override:
     # 仅在模型已经给出 safe 结论后再次执行。
     # 这里不替代前置启发式，而是用于兜住“模型已看过代码但仍误判 safe”的情况。
+    semantic_flows = list((heuristic_meta or {}).get("semantic_flows", []) or plan.get("semantic_flows", []) or [])
+    if semantic_flows and detection_result.get("verdict") in {"vulnerable", "needs_manual_review"}:
+        flow = semantic_flows[0]
+        semantic_family = _normalize_override_family(flow.get("family", "")) or flow.get("family", "")
+        model_family = normalize_vuln_family(detection_result.get("vuln_type", ""))
+        if semantic_family and model_family != semantic_family:
+            chain = " -> ".join(flow.get("call_chain", [])) or "direct"
+            original_type = str(detection_result.get("vuln_type", "") or "")
+            reconciled = dict(detection_result)
+            reconciled.update(
+                {
+                    "verdict": "needs_manual_review",
+                    "vuln_type": VULN_FAMILY_LABELS.get(semantic_family, semantic_family),
+                    "reason": _join_notes(
+                        "模型漏洞类型与 AST source→sink 家族不一致，已采用可复现的静态证据作为主分类。",
+                        f"AST 家族: {semantic_family}; 调用链: {chain}",
+                        f"模型原始类型: {original_type}" if original_type else "",
+                    ),
+                    "code_evidence": _short_text((heuristic_meta or {}).get("semantic_evidence", ""), limit=260),
+                    "confidence": max(float(detection_result.get("confidence", 0.0) or 0.0), 0.75),
+                    "hard_override_family": semantic_family,
+                    "hard_override_reason": "semantic_family_conflict",
+                    "model_vuln_type": original_type,
+                }
+            )
+            return reconciled, {
+                "triggered": True,
+                "reason": "AST 语义家族覆盖了不一致的模型分类。",
+                "family": semantic_family,
+                "detail": f"semantic_family_conflict: {model_family or 'unknown'} -> {semantic_family}",
+            }
+
     if detection_result.get("verdict") != "safe":
         return detection_result, {"triggered": False, "reason": ""}
+
+    if semantic_flows:
+        flow = semantic_flows[0]
+        family = _normalize_override_family(flow.get("family", "")) or flow.get("family", "")
+        chain = " -> ".join(flow.get("call_chain", [])) or "direct"
+        overridden = dict(detection_result)
+        overridden.update(
+            {
+                "verdict": "needs_manual_review",
+                "vuln_type": detection_result.get("vuln_type")
+                or VULN_FAMILY_LABELS.get(family, family or "跨函数污点流"),
+                "reason": _join_notes(
+                    "模型判定为 safe，但 AST 项目分析确认 source→sink 数据依赖。",
+                    f"调用链: {chain}",
+                    "为避免跨函数漏判，已按失败安全策略提升为待人工复核。",
+                ),
+                "code_evidence": _short_text((heuristic_meta or {}).get("semantic_evidence", ""), limit=260),
+                "confidence": max(float(detection_result.get("confidence", 0.0) or 0.0), 0.75),
+                "hard_override_family": family,
+                "hard_override_reason": "semantic_source_to_sink",
+            }
+        )
+        return overridden, {
+            "triggered": True,
+            "reason": "AST 跨函数 source→sink 证据覆盖了模型 safe 结论。",
+            "family": family,
+            "detail": chain,
+        }
 
     ext = os.path.splitext(file_path)[1].lower()
     rules = HARD_OVERRIDE_RULES.get(ext, [])
@@ -2642,11 +3243,11 @@ fixed_code_snippet: 推荐替换的完整闭合代码块，不允许输出行号
 
 
 def parse_repair_output(raw_text):
-    parsed = _extract_json_object(raw_text) or _parse_mapping_literal(raw_text)
-    if not parsed:
+    parsed = _extract_json_object(raw_text)
+    if not _payload_matches_schema(parsed, REPAIR_OUTPUT_SCHEMA):
         result = _default_repair_result()
         result["minimal_fix"] = str(raw_text or "")
-        result["report_fix_summary"] = "修复输出格式异常，已保留原始内容供人工复核。"
+        result["report_fix_summary"] = "修复输出未通过 JSON Schema 校验，已保留原始内容供人工复核。"
         return result
 
     report_fix_summary = parsed.get("report_fix_summary", "") or parsed.get("summary", "")
@@ -3139,9 +3740,19 @@ def _evaluate_secondary_rule(code_content, rule, main_family):
 def scan_secondary_risks(file_path, code_content, plan, main_family):
     ext = os.path.splitext(file_path)[1].lower()
     results = []
+    actionable_families = {
+        _normalize_override_family(flow.get("family", ""))
+        for flow in plan.get("semantic_flows", [])
+        if flow.get("family")
+    }
+    configuration_only_families = {
+        _normalize_override_family(flow.get("family", ""))
+        for flow in plan.get("configuration_flows", [])
+        if flow.get("family")
+    } - actionable_families
     for rule in SECONDARY_RISK_RULES.get(ext, []):
         matched = _evaluate_secondary_rule(code_content, {**rule, "ext": ext}, main_family)
-        if matched:
+        if matched and _normalize_override_family(matched.get("family", "")) not in configuration_only_families:
             results.append(matched)
     return results
 
@@ -3159,10 +3770,25 @@ def collect_secondary_findings(file_path, code_content, plan, detection_result):
     seen_families = set()
     weak_notes = []
     code_lines = code_content.splitlines()
+    actionable_semantic_families = {
+        _normalize_override_family(flow.get("family", ""))
+        for flow in plan.get("semantic_flows", [])
+        if flow.get("family")
+    }
+    configuration_only_families = {
+        _normalize_override_family(flow.get("family", ""))
+        for flow in plan.get("configuration_flows", [])
+        if flow.get("family")
+    } - actionable_semantic_families
 
     for label, line_numbers in pattern_line_map.items():
         family = SECONDARY_LABEL_FAMILY_MAP.get(label)
-        if not family or family == main_family or family in seen_families:
+        if (
+            not family
+            or family == main_family
+            or family in seen_families
+            or family in configuration_only_families
+        ):
             continue
         evidence_lines = []
         for line_no in line_numbers[:2]:
@@ -3877,6 +4503,16 @@ def make_report_entry(**kwargs):
         "hard_override_family": "",
         "hard_override_reason": "",
         "polluted_source_flag": "否",
+        "semantic_backend": "",
+        "semantic_flows_data": [],
+        "semantic_evidence": "",
+        "detection_model_telemetry": {},
+        "repair_model_telemetry": {},
+        "evidence_grounding": {"status": "not_run", "unsupported_claims": []},
+        "patch_verification": {"status": "not_run", "reason": "patch verification not requested"},
+        "patch_diff_path": "",
+        "source_encoding": "",
+        "source_size_bytes": 0,
         "start_line": 0,
         "end_line": 0,
         "confidence": 0.0,
@@ -3884,6 +4520,7 @@ def make_report_entry(**kwargs):
         "detection_basis": "",
         "knowledge_used": "否",
         "knowledge_stage": "未参与",
+        "knowledge_retrieval_trace": [],
         "repair_mainline": "",
         "repair_consistency": "",
         "repair_consistency_status": "",
@@ -3910,22 +4547,30 @@ def evaluate_suspected(detection_result):
         return "待人工复核"
     if verdict == "safe":
         return "否"
+    if verdict == "no_candidate":
+        return "未命中候选"
     return "未分析"
 
 
-def render_report(target_dir, entries, db_meta=None, root_cause_groups=None):
+def render_report(target_dir, entries, db_meta=None, root_cause_groups=None, report_path=None):
     db_meta = db_meta or {}
     root_cause_groups = root_cause_groups or []
-    report_path = os.path.join(SCRIPT_DIR, "awdp_pro_report.md")
+    report_path = report_path or os.path.join(SCRIPT_DIR, "awdp_pro_report.md")
 
     total_count = len(entries)
     suspected_count = sum(1 for item in entries if item["suspected"] == "是")
     review_count = sum(1 for item in entries if item["suspected"] == "待人工复核")
     safe_count = sum(1 for item in entries if item["suspected"] == "否")
-    other_count = total_count - suspected_count - review_count - safe_count
+    no_candidate_count = sum(1 for item in entries if item["suspected"] == "未命中候选")
+    other_count = total_count - suspected_count - review_count - safe_count - no_candidate_count
     risk_entries = [item for item in entries if item.get("suspected") in {"是", "待人工复核"}]
     safe_entries = [item for item in entries if item.get("suspected") == "否"]
-    other_entries = [item for item in entries if item.get("suspected") not in {"是", "待人工复核", "否"}]
+    no_candidate_entries = [item for item in entries if item.get("suspected") == "未命中候选"]
+    other_entries = [
+        item
+        for item in entries
+        if item.get("suspected") not in {"是", "待人工复核", "否", "未命中候选"}
+    ]
 
     def _render_location_detail(entry):
         if entry.get("start_line") and entry.get("end_line"):
@@ -3965,7 +4610,9 @@ def render_report(target_dir, entries, db_meta=None, root_cause_groups=None):
         "",
         "## 概览",
         "",
-        f"- 文件总数: `{total_count}` | 明确疑似: `{suspected_count}` | 待人工复核: `{review_count}` | 安全: `{safe_count}`",
+        f"- 文件总数: `{total_count}` | 明确疑似: `{suspected_count}` | 待人工复核: `{review_count}` | "
+        f"安全: `{safe_count}` | 未命中候选: `{no_candidate_count}`",
+        "- 语义说明: `未命中候选` 只表示预筛未触发深度分析，不能作为代码安全证明。",
         "",
     ]
     if other_count:
@@ -4045,6 +4692,14 @@ def render_report(target_dir, entries, db_meta=None, root_cause_groups=None):
                 lines.append(f"- 建议级别: {entry.get('repair_advice_level') or '临时缓解'}")
             if _should_show_syntax_detail(entry.get("syntax_check", "")):
                 lines.append(f"- 语法: {entry.get('syntax_check')}")
+            patch_verification = entry.get("patch_verification", {}) or {}
+            if patch_verification.get("status") not in {"", "not_run"}:
+                lines.append(
+                    f"- 隔离补丁验证: {patch_verification.get('status')}；"
+                    f"{patch_verification.get('reason', '')}"
+                )
+            if entry.get("patch_diff_path"):
+                lines.append(f"- 补丁差异: `{entry.get('patch_diff_path')}`")
 
             note_text = _short_text(entry.get("note", ""), limit=220)
             if _meaningful_text(note_text) and note_text not in {evidence_text, repair_summary}:
@@ -4077,6 +4732,16 @@ def render_report(target_dir, entries, db_meta=None, root_cause_groups=None):
             lines.append(f"- `{entry['file_path']}`: " + "；".join(part for part in detail_parts if _meaningful_text(part)))
         lines.append("")
 
+    lines.extend(["## 未命中候选文件", ""])
+    if not no_candidate_entries:
+        lines.extend(["- 无。", ""])
+    else:
+        lines.extend(["- 以下文件仅完成候选预筛，未形成安全证明。", ""])
+        for entry in no_candidate_entries:
+            detail_text = _merge_report_text(entry.get("note", ""), entry.get("prescreen", ""), limit=180)
+            lines.append(f"- `{entry['file_path']}`: {detail_text or '未触发深度分析。'}")
+        lines.append("")
+
     if other_entries:
         lines.extend(["## 其他状态", ""])
         for entry in other_entries:
@@ -4087,30 +4752,50 @@ def render_report(target_dir, entries, db_meta=None, root_cause_groups=None):
             lines.append(f"- `{entry['file_path']}`: {entry.get('suspected') or '未分析'}；" + "；".join(extra_parts))
         lines.append("")
 
-    with open(report_path, "w", encoding="utf-8") as report_file:
-        report_file.write("\n".join(lines))
-    return report_path
+    return _atomic_write_text(report_path, "\n".join(lines) + "\n")
 
 
 # ==========================================
 # 11. Scan directory / main
 # ==========================================
-def audit_single_file(file_path, code_content, vector_db, project_context=None):
-    rel_path = _relative_path(file_path)
+def audit_single_file(file_path, code_content, vector_db, project_context=None, display_path=None):
+    rel_path = display_path or _relative_path(file_path)
     ext = os.path.splitext(file_path)[1].lower()
     syntax_check = validate_file(file_path, code_content, ext)
     heuristic_meta = run_heuristic_prescreen(code_content, file_path=file_path, project_context=project_context)
     plan = build_scan_plan(file_path, code_content, project_context=project_context, heuristic_meta=heuristic_meta)
+    if FORCE_DEEP_SCAN_ALL:
+        bypassed_gate = plan["status"] == "no_candidate"
+        forced_snippet, forced_mode, forced_note, forced_focus = extract_deep_all_snippet(code_content)
+        plan.update(
+            {
+                "status": "candidate",
+                "snippet": forced_snippet,
+                "snippet_mode": f"deep_all:{forced_mode}",
+                "focus": forced_focus or "整文件深度审计",
+                "note": _join_notes(
+                    forced_note,
+                    "显式 --deep-all：绕过候选门控并送入模型。"
+                    if bypassed_gate
+                    else "显式 --deep-all：使用全文件或均衡上下文替代风险局部切片。",
+                ),
+            }
+        )
     detection_result = {}
     repair_result = _default_repair_result()
     knowledge_meta = _default_knowledge_result()
+    detection_model_telemetry = {}
+    repair_model_telemetry = {}
+    evidence_grounding = {"status": "not_run", "unsupported_claims": []}
     detection_basis = "规则预筛 + LLM 代码上下文判定"
     if heuristic_meta.get("force_deep_scan"):
         detection_basis += "（启发式强制送检）"
+    if heuristic_meta.get("semantic_flows"):
+        detection_basis += " + Python AST 跨函数污点分析"
 
-    if plan["status"] == "prescreen_only":
+    if plan["status"] == "no_candidate":
         detection_result = {
-            "verdict": "safe",
+            "verdict": "no_candidate",
             "vuln_type": "",
             "reason": plan["reason"],
             "code_evidence": plan["reason"],
@@ -4118,7 +4803,7 @@ def audit_single_file(file_path, code_content, vector_db, project_context=None):
         }
         entry = make_report_entry(
             file_path=rel_path,
-            suspected="否",
+            suspected="未命中候选",
             vuln_type=detection_result.get("vuln_type", ""),
             reason=detection_result.get("reason", ""),
             code_evidence=detection_result.get("code_evidence", ""),
@@ -4126,7 +4811,7 @@ def audit_single_file(file_path, code_content, vector_db, project_context=None):
             minimal_fix="未触发深度分析。",
             confidence=detection_result.get("confidence", 0.0),
             prescreen=plan["note"],
-            detection_basis="仅预筛",
+            detection_basis="仅预筛（未形成安全证明）",
             knowledge_used="否",
             knowledge_stage="未参与",
             repair_mainline="",
@@ -4138,38 +4823,82 @@ def audit_single_file(file_path, code_content, vector_db, project_context=None):
         return {"entry": entry, "rel_path": rel_path}
 
     prejudge_meta = _default_knowledge_result()
-    if RAG_MODE == "prejudge":
-        prejudge_meta = search_knowledge_base(vector_db, plan, {}, phase="prejudge")
-        if prejudge_meta.get("used"):
-            detection_basis += "（实验：判定前知识库参与）"
-    detection_prompt = build_detection_prompt(file_path, plan, prejudge_meta)
-    detection_call = call_ollama(detection_prompt, DETECTION_NUM_PREDICT)
-    if not detection_call["ok"]:
+    if STATIC_ONLY:
+        semantic_flows = list(heuristic_meta.get("semantic_flows", []) or [])
+        static_family = str((semantic_flows[0] if semantic_flows else {}).get("family", "") or "")
         detection_result = {
             "verdict": "needs_manual_review",
-            "vuln_type": "",
-            "reason": detection_call["error"],
-            "code_evidence": plan["reason"],
-            "confidence": 0.0,
+            "vuln_type": VULN_FAMILY_LABELS.get(static_family, static_family),
+            "reason": "静态模式命中风险候选；未调用 LLM，结论保守标记为待人工复核。",
+            "code_evidence": heuristic_meta.get("semantic_evidence", "") or plan["reason"],
+            "confidence": 0.75 if semantic_flows else 0.45,
         }
+        detection_basis = "规则预筛 + 静态分析（未调用 LLM）"
     else:
-        detection_result = parse_detection_output(detection_call["text"])
+        if RAG_MODE == "prejudge":
+            prejudge_meta = search_knowledge_base(vector_db, plan, {}, phase="prejudge")
+            if prejudge_meta.get("used"):
+                detection_basis += "（实验：判定前知识库参与）"
+        detection_prompt = build_detection_prompt(file_path, plan, prejudge_meta)
+        detection_call = call_ollama(
+            detection_prompt,
+            DETECTION_NUM_PREDICT,
+            output_schema=DETECTION_OUTPUT_SCHEMA,
+        )
+        detection_model_telemetry = dict(detection_call.get("telemetry", {}) or {})
+        if not detection_call["ok"]:
+            detection_result = {
+                "verdict": "needs_manual_review",
+                "vuln_type": "",
+                "reason": detection_call["error"],
+                "code_evidence": plan["reason"],
+                "confidence": 0.0,
+            }
+        else:
+            detection_result = parse_detection_output(detection_call["text"])
+
+        detection_result, evidence_grounding = _ground_detection_evidence(code_content, detection_result)
+        if evidence_grounding.get("status") == "failed":
+            detection_basis += " + 模型证据落地校验（未通过）"
 
     detection_result, override_meta = _apply_hard_override(file_path, code_content, plan, detection_result, heuristic_meta=heuristic_meta)
     if override_meta.get("triggered"):
         detection_basis += " + 硬规则兜底"
 
-    if detection_result.get("verdict") in {"vulnerable", "needs_manual_review"}:
-        if RAG_MODE in {"repair_only", "prejudge"}:
-            knowledge_meta = search_knowledge_base(vector_db, plan, detection_result, phase="repair")
-        repair_prompt = build_repair_prompt(file_path, plan, detection_result, knowledge_meta)
-        repair_call = call_ollama(repair_prompt, REPAIR_NUM_PREDICT)
-        if repair_call["ok"]:
-            repair_result = parse_repair_output(repair_call["text"])
-        else:
+    risk_verdict = detection_result.get("verdict") in {"vulnerable", "needs_manual_review"}
+    should_generate_repair = bool(
+        risk_verdict
+        and not STATIC_ONLY
+        and GENERATE_REPAIRS
+        and not detection_result.get("ungrounded_claims")
+        and (
+            detection_result.get("verdict") == "vulnerable"
+            or REPAIR_MANUAL_REVIEW
+        )
+    )
+    if risk_verdict:
+        if STATIC_ONLY:
             repair_result = _default_repair_result()
-            repair_result["minimal_fix"] = repair_call["error"]
-            repair_result["report_fix_summary"] = "模型未返回稳定修复建议，请人工复核。"
+            repair_result["report_fix_summary"] = "静态模式不生成模型补丁，请按证据链人工修复。"
+        elif should_generate_repair and RAG_MODE in {"repair_only", "prejudge"}:
+            knowledge_meta = search_knowledge_base(vector_db, plan, detection_result, phase="repair")
+        if should_generate_repair:
+            repair_prompt = build_repair_prompt(file_path, plan, detection_result, knowledge_meta)
+            repair_call = call_ollama(
+                repair_prompt,
+                REPAIR_NUM_PREDICT,
+                output_schema=REPAIR_OUTPUT_SCHEMA,
+            )
+            repair_model_telemetry = dict(repair_call.get("telemetry", {}) or {})
+            if repair_call["ok"]:
+                repair_result = parse_repair_output(repair_call["text"])
+            else:
+                repair_result = _default_repair_result()
+                repair_result["minimal_fix"] = repair_call["error"]
+                repair_result["report_fix_summary"] = "模型未返回稳定修复建议，请人工复核。"
+        elif not STATIC_ONLY:
+            repair_result = _default_repair_result()
+            repair_result["report_fix_summary"] = "本次运行未生成模型补丁。"
     else:
         repair_result = _default_repair_result()
         if not knowledge_meta.get("used"):
@@ -4191,6 +4920,20 @@ def audit_single_file(file_path, code_content, vector_db, project_context=None):
     secondary_findings = format_secondary_findings(secondary_findings_list)
     potential_secondary_findings = format_potential_secondary_findings(potential_secondary_findings_list)
     root_cause_meta = build_root_cause_metadata(file_path, code_content, plan, detection_result, repair_result)
+    semantic_flows = list(heuristic_meta.get("semantic_flows", []) or [])
+    semantic_line = 0
+    semantic_location = ""
+    if semantic_flows:
+        primary_flow = semantic_flows[0]
+        if os.path.abspath(str(primary_flow.get("sink_file", ""))) == os.path.abspath(file_path):
+            semantic_line = int(primary_flow.get("sink_line", 0) or 0)
+            semantic_location = str(primary_flow.get("sink", "") or "")
+        else:
+            for source in primary_flow.get("sources", []):
+                if os.path.abspath(str(source.get("file", ""))) == os.path.abspath(file_path):
+                    semantic_line = int(source.get("line", 0) or 0)
+                    semantic_location = str(source.get("name", "") or "")
+                    break
 
     entry = make_report_entry(
         file_path=rel_path,
@@ -4209,22 +4952,29 @@ def audit_single_file(file_path, code_content, vector_db, project_context=None):
         hard_override_family=override_meta.get("family") or detection_result.get("hard_override_family", "") or heuristic_meta.get("hard_override_family", ""),
         hard_override_reason=override_meta.get("detail") or detection_result.get("hard_override_reason", "") or heuristic_meta.get("hard_override_reason", ""),
         polluted_source_flag="是" if heuristic_meta.get("is_source_highly_polluted") else "否",
+        semantic_backend=heuristic_meta.get("semantic_backend", ""),
+        semantic_flows_data=semantic_flows,
+        semantic_evidence=heuristic_meta.get("semantic_evidence", ""),
+        detection_model_telemetry=detection_model_telemetry,
+        repair_model_telemetry=repair_model_telemetry,
+        evidence_grounding=evidence_grounding,
         reason=detection_result.get("reason", ""),
         code_evidence=_clean_evidence_text(detection_result.get("code_evidence", "")),
         minimal_fix=repair_result.get("minimal_fix", ""),
         report_fix_summary=report_fix.get("summary", ""),
         report_fix_code=report_fix.get("code", ""),
         report_fix_language=report_fix.get("language", "text"),
-        vuln_location=repair_result.get("vuln_location", ""),
+        vuln_location=repair_result.get("vuln_location", "") or semantic_location,
         original_code_snippet=original_display,
         fixed_code_snippet=report_fix.get("code", ""),
-        start_line=location_result.get("start_line", 0),
-        end_line=location_result.get("end_line", 0),
+        start_line=location_result.get("start_line", 0) or semantic_line,
+        end_line=location_result.get("end_line", 0) or semantic_line,
         confidence=detection_result.get("confidence", 0.0),
         prescreen=plan["note"],
         detection_basis=detection_basis,
         knowledge_used="是" if knowledge_meta.get("used") else "否",
         knowledge_stage=knowledge_meta.get("stage", "未参与"),
+        knowledge_retrieval_trace=knowledge_meta.get("retrieval_trace", []),
         repair_mainline=repair_result.get("repair_mainline")
         or consistency_result.get("mainline")
         or get_repair_mainline_hint(detection_result.get("vuln_type", "")),
@@ -4252,12 +5002,118 @@ def audit_single_file(file_path, code_content, vector_db, project_context=None):
     return {"entry": entry, "rel_path": rel_path}
 
 
-def scan_directory(target_dir, vector_db=None):
+def _summarize_entries(entries):
+    return RunSummary.from_entries(entries).to_dict()
+
+
+def _summarize_model_telemetry(entries):
+    def summarize(stage):
+        telemetry_items = [
+            dict(entry.get(f"{stage}_model_telemetry", {}) or {})
+            for entry in entries
+            if entry.get(f"{stage}_model_telemetry")
+        ]
+        prompt_tokens = sum(int(item.get("prompt_eval_count", 0) or 0) for item in telemetry_items)
+        eval_tokens = sum(int(item.get("eval_count", 0) or 0) for item in telemetry_items)
+        prompt_duration_ms = sum(float(item.get("prompt_eval_duration_ms", 0.0) or 0.0) for item in telemetry_items)
+        eval_duration_ms = sum(float(item.get("eval_duration_ms", 0.0) or 0.0) for item in telemetry_items)
+        return {
+            "calls": len(telemetry_items),
+            "failed_calls": sum(1 for item in telemetry_items if item.get("ok") is False),
+            "wall_duration_ms": round(
+                sum(float(item.get("wall_duration_ms", 0.0) or 0.0) for item in telemetry_items), 3
+            ),
+            "total_duration_ms": round(
+                sum(float(item.get("total_duration_ms", 0.0) or 0.0) for item in telemetry_items), 3
+            ),
+            "load_duration_ms": round(
+                sum(float(item.get("load_duration_ms", 0.0) or 0.0) for item in telemetry_items), 3
+            ),
+            "prompt_eval_count": prompt_tokens,
+            "prompt_tokens_per_second": round(prompt_tokens / (prompt_duration_ms / 1000), 3)
+            if prompt_duration_ms
+            else 0.0,
+            "eval_count": eval_tokens,
+            "eval_tokens_per_second": round(eval_tokens / (eval_duration_ms / 1000), 3)
+            if eval_duration_ms
+            else 0.0,
+        }
+
+    return {stage: summarize(stage) for stage in ("detection", "repair")}
+
+
+def _verify_entry_patches(
+    target_dir,
+    entries,
+    source_path_map,
+    patches_dir=None,
+    test_commands=(),
+    timeout=30,
+):
+    summary = {"requested": 0, "validated": 0, "failed": 0, "inconclusive": 0, "rejected": 0}
+    for entry in entries:
+        if entry.get("suspected") not in {"是", "待人工复核"}:
+            continue
+        original_snippet = str(entry.get("original_code_snippet", "") or "")
+        replacement_snippet = str(entry.get("fixed_code_snippet", "") or entry.get("report_fix_code", "") or "")
+        if not original_snippet or not replacement_snippet:
+            entry["patch_verification"] = {
+                "status": "not_available",
+                "reason": "model did not produce an exact replacement pair",
+            }
+            continue
+        actual_path = source_path_map.get(entry.get("file_path", ""))
+        if not actual_path:
+            entry["patch_verification"] = {
+                "status": "rejected",
+                "reason": "report path could not be mapped back to the scan root",
+            }
+            summary["rejected"] += 1
+            continue
+        relative_file = os.path.relpath(actual_path, target_dir)
+        summary["requested"] += 1
+        verification = verify_patch_in_isolated_copy(
+            target_dir,
+            relative_file,
+            original_snippet,
+            replacement_snippet,
+            test_commands=test_commands,
+            timeout=timeout,
+        )
+        entry["patch_verification"] = verification.to_dict(include_diff=False)
+        status = verification.status
+        if status in summary:
+            summary[status] += 1
+        if patches_dir and verification.diff:
+            safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", relative_file).strip("_") or "patch"
+            diff_path = os.path.join(patches_dir, f"{safe_name}-{verification.diff_sha256[:12]}.diff")
+            entry["patch_diff_path"] = _atomic_write_text(diff_path, verification.diff)
+    return summary
+
+
+def scan_directory(
+    target_dir,
+    vector_db=None,
+    report_path=None,
+    findings_path=None,
+    sarif_path=None,
+    manifest_path=None,
+    run_id=None,
+    scan_cache=None,
+    verify_patches=False,
+    patches_dir=None,
+    patch_test_commands=(),
+    patch_test_timeout=30,
+):
+    started_at = _utc_timestamp()
+    run_id = run_id or _new_run_id()
     print(f"{Colors.BLUE}开始扫描目录: {target_dir}{Colors.RESET}")
-    print(
-        f"{Colors.BLUE}当前策略: 规则预筛 -> LLM 判定 -> 修复约束 -> 人工修复建议 | "
-        f"RAG_MODE={RAG_MODE}{Colors.RESET}"
+    strategy = (
+        "规则预筛 -> 静态语义证据 -> 人工复核"
+        if STATIC_ONLY
+        else "规则预筛 -> LLM 判定 -> 修复约束 -> 隔离补丁验证"
     )
+    print(f"{Colors.BLUE}当前策略: {strategy} | RAG_MODE={RAG_MODE}{Colors.RESET}")
     print(
         f"{Colors.BLUE}目录策略: AWDP_SCAN_UPLOADS={'on' if SCAN_UPLOADS else 'off'} | "
         f"忽略目录={','.join(sorted(IGNORE_DIRS)) or '无'}{Colors.RESET}"
@@ -4266,49 +5122,104 @@ def scan_directory(target_dir, vector_db=None):
     db_meta = load_db_metadata()
     entries = []
     tasks = []
-
-    for root, dirs, files in os.walk(target_dir):
-        dirs[:] = [directory for directory in dirs if directory.lower() not in IGNORE_DIRS]
-        for filename in files:
-            ext = os.path.splitext(filename)[1].lower()
-            if ext not in ALLOWED_EXTENSIONS:
-                continue
-
-            file_path = os.path.join(root, filename)
-            rel_path = _relative_path(file_path)
-            try:
-                with open(file_path, "r", encoding="utf-8", errors="ignore") as code_file:
-                    code_content = code_file.read()
-            except Exception as exc:
-                entries.append(
-                    make_report_entry(
-                        file_path=rel_path,
-                        suspected="未分析",
-                        prescreen="读取失败",
-                        detection_basis="未执行",
-                        syntax_check="未执行",
-                        note=f"文件读取失败: {exc}",
-                    )
+    source_path_map = {}
+    display_path_map = {}
+    source_metadata_map = {}
+    discovery_policy = DiscoveryPolicy(
+        max_files=MAX_SOURCE_FILES,
+        max_file_bytes=MAX_SOURCE_FILE_BYTES,
+        max_total_bytes=MAX_SOURCE_TOTAL_BYTES,
+        encodings=SOURCE_ENCODINGS or ("utf-8-sig",),
+    )
+    discovered_sources, discovery_issues, discovery_stats = discover_sources(
+        target_dir,
+        allowed_extensions=ALLOWED_EXTENSIONS,
+        ignored_directories=IGNORE_DIRS,
+        policy=discovery_policy,
+    )
+    for issue in discovery_issues:
+        entries.append(
+            make_report_entry(
+                file_path=issue.relative_path,
+                suspected="未分析",
+                prescreen="安全发现拒绝",
+                detection_basis="未执行",
+                syntax_check="未执行",
+                source_size_bytes=issue.size_bytes,
+                note=issue.reason,
+            )
+        )
+    for source in discovered_sources:
+        file_path = source.path
+        rel_path = source.relative_path
+        code_content = source.content
+        source_path_map[rel_path] = file_path
+        display_path_map[file_path] = rel_path
+        source_metadata_map[file_path] = {
+            "source_encoding": source.encoding,
+            "source_size_bytes": source.size_bytes,
+        }
+        if not code_content.strip():
+            entries.append(
+                make_report_entry(
+                    file_path=rel_path,
+                    suspected="否",
+                    prescreen="空文件",
+                    detection_basis="未执行",
+                    reason="文件为空。",
+                    syntax_check="未执行",
+                    source_encoding=source.encoding,
+                    source_size_bytes=source.size_bytes,
+                    note="空文件未进入审计流程。",
                 )
-                continue
-
-            if not code_content.strip():
-                entries.append(
-                    make_report_entry(
-                        file_path=rel_path,
-                        suspected="否",
-                        prescreen="空文件",
-                        detection_basis="未执行",
-                        reason="文件为空。",
-                        syntax_check="未执行",
-                        note="空文件未进入审计流程。",
-                    )
-                )
-                continue
-
-            tasks.append((file_path, code_content))
+            )
+            continue
+        tasks.append((file_path, code_content))
 
     project_context = build_project_context(tasks)
+    project_digest = project_fingerprint(
+        (display_path_map[file_path], code_content) for file_path, code_content in tasks
+    )
+    cache_configuration = {
+        "scanner_version": SCANNER_VERSION,
+        "model": MODEL_NAME,
+        "detection_prompt": DETECTION_PROMPT_VERSION,
+        "repair_prompt": REPAIR_PROMPT_VERSION,
+        "rag_mode": RAG_MODE,
+        "static_only": STATIC_ONLY,
+        "deep_all": FORCE_DEEP_SCAN_ALL,
+        "generate_repairs": GENERATE_REPAIRS,
+        "repair_manual_review": REPAIR_MANUAL_REVIEW,
+        "model_seed": MODEL_SEED,
+        "knowledge_corpus_sha256": db_meta.get("knowledge_corpus_sha256", ""),
+        "knowledge_strategy": db_meta.get("strategy_version", ""),
+        "embedding_model_sha256": db_meta.get("embedding_model_sha256", ""),
+        "min_vuln_confidence": MIN_VULN_CONFIDENCE,
+        "scan_uploads": SCAN_UPLOADS,
+    }
+    uncached_tasks = []
+    task_cache_keys = {}
+    cache_hits = 0
+    for file_path, code_content in tasks:
+        if scan_cache is None:
+            uncached_tasks.append((file_path, code_content))
+            continue
+        cache_key = scan_cache.make_key(
+            file_path=display_path_map[file_path],
+            content=code_content,
+            project_digest=project_digest,
+            configuration=cache_configuration,
+        )
+        cached_entry = scan_cache.get(cache_key)
+        if cached_entry is None:
+            uncached_tasks.append((file_path, code_content))
+            task_cache_keys[file_path] = cache_key
+            continue
+        cached_entry["cache_hit"] = True
+        cached_entry.update(source_metadata_map.get(file_path, {}))
+        entries.append(cached_entry)
+        cache_hits += 1
+
     effective_workers = max(1, MAX_WORKERS)
     with ThreadPoolExecutor(max_workers=effective_workers) as executor:
         future_map = {
@@ -4318,16 +5229,21 @@ def scan_directory(target_dir, vector_db=None):
                 code_content,
                 vector_db,
                 project_context,
-            ): _relative_path(file_path)
-            for file_path, code_content in tasks
+                display_path_map[file_path],
+            ): (display_path_map[file_path], file_path, task_cache_keys.get(file_path, ""))
+            for file_path, code_content in uncached_tasks
         }
 
         for future in as_completed(future_map):
-            rel_path = future_map[future]
+            rel_path, source_path, cache_key = future_map[future]
             try:
                 result = future.result()
                 entry = result["entry"]
+                entry["cache_hit"] = False
+                entry.update(source_metadata_map.get(source_path, {}))
                 entries.append(entry)
+                if scan_cache is not None and cache_key:
+                    scan_cache.put(cache_key, entry)
 
                 if entry["suspected"] == "是":
                     status_icon = "🚨 VULN"
@@ -4335,10 +5251,16 @@ def scan_directory(target_dir, vector_db=None):
                 elif entry["suspected"] == "待人工复核":
                     status_icon = "⚠️ WARN"
                     vuln_info = f"  ->  {entry['vuln_type'] or '未定'} (需人工复核)"
-                else:
+                elif entry["suspected"] == "否":
                     status_icon = "✅ SAFE"
                     vuln_info = ""
-                
+                elif entry["suspected"] == "未命中候选":
+                    status_icon = "▫️ NO-CANDIDATE"
+                    vuln_info = "  ->  未形成安全证明"
+                else:
+                    status_icon = "❔ NOT-ANALYZED"
+                    vuln_info = ""
+
                 output_path = entry['file_path'].ljust(60)
                 print(f"[{status_icon}]  {output_path}{vuln_info}")
             except Exception as exc:
@@ -4354,19 +5276,225 @@ def scan_directory(target_dir, vector_db=None):
                 )
 
     entries.sort(key=lambda item: item["file_path"])
+    patch_verification_summary = (
+        _verify_entry_patches(
+            target_dir,
+            entries,
+            source_path_map,
+            patches_dir=patches_dir,
+            test_commands=patch_test_commands,
+            timeout=patch_test_timeout,
+        )
+        if verify_patches
+        else {"requested": 0, "validated": 0, "failed": 0, "inconclusive": 0, "rejected": 0}
+    )
     root_cause_groups = aggregate_root_causes(entries)
-    report_path = render_report(target_dir, entries, db_meta=db_meta, root_cause_groups=root_cause_groups)
+    report_path = render_report(
+        target_dir,
+        entries,
+        db_meta=db_meta,
+        root_cause_groups=root_cause_groups,
+        report_path=report_path,
+    )
+    if findings_path:
+        write_findings_json(
+            findings_path,
+            run_id=run_id,
+            target=target_dir,
+            entries=entries,
+            root_cause_groups=root_cause_groups,
+        )
+    if sarif_path:
+        write_sarif(sarif_path, entries, SCANNER_VERSION)
+    if manifest_path:
+        atomic_write_json(
+            manifest_path,
+            {
+                "schema_version": "awdp-run-manifest-v1",
+                "run_id": run_id,
+                "status": "completed",
+                "started_at_utc": started_at,
+                "completed_at_utc": _utc_timestamp(),
+                "scanner_version": SCANNER_VERSION,
+                "scanner_revision": _git_revision(),
+                "runtime": {"python": platform.python_version(), "platform": platform.platform()},
+                "target": os.path.abspath(target_dir),
+                "configuration": {
+                    "model": MODEL_NAME,
+                    "rag_mode": RAG_MODE,
+                    "static_only": STATIC_ONLY,
+                    "deep_all": FORCE_DEEP_SCAN_ALL,
+                    "generate_repairs": GENERATE_REPAIRS,
+                    "repair_manual_review": REPAIR_MANUAL_REVIEW,
+                    "model_seed": MODEL_SEED,
+                    "model_keep_alive": MODEL_KEEP_ALIVE,
+                    "remote_model_allowed": REMOTE_MODEL_ALLOWED,
+                    "max_workers": MAX_WORKERS,
+                    "scan_uploads": SCAN_UPLOADS,
+                    "ignored_directories": sorted(IGNORE_DIRS),
+                    "cache_enabled": scan_cache is not None,
+                    "patch_test_commands": [list(command) for command in patch_test_commands],
+                    "discovery_policy": discovery_stats.get("policy", {}),
+                },
+                "knowledge_base": db_meta,
+                "discovery": discovery_stats,
+                "summary": _summarize_entries(entries),
+                "model_telemetry": _summarize_model_telemetry(entries),
+                "cache": {"project_sha256": project_digest, "hits": cache_hits},
+                "patch_verification": patch_verification_summary,
+                "artifacts": {
+                    "report": os.path.abspath(report_path),
+                    "findings": os.path.abspath(findings_path) if findings_path else "",
+                    "sarif": os.path.abspath(sarif_path) if sarif_path else "",
+                    "patches": os.path.abspath(patches_dir) if patches_dir else "",
+                },
+            },
+        )
     print(f"{Colors.GREEN}审计完成，报告已写入: {report_path}{Colors.RESET}")
     return report_path
 
 
+def build_argument_parser():
+    parser = argparse.ArgumentParser(
+        prog="awdp-scanner",
+        description="面向 AWD/AWDP 防守场景的离线优先源码审计器。",
+    )
+    parser.add_argument("--target", default=TARGET_DIRECTORY, help="待审计源码目录。")
+    parser.add_argument("--output-dir", help="本次运行产物目录；默认创建唯一的 awdp_runs/<run-id>。")
+    parser.add_argument("--report", help="Markdown 报告路径；默认写入本次运行目录。")
+    parser.add_argument("--no-rag", action="store_true", help="本次运行不加载向量知识库。")
+    parser.add_argument("--static-only", action="store_true", help="不启动或调用 LLM，仅输出静态候选与证据链。")
+    parser.add_argument(
+        "--deep-all",
+        action="store_true",
+        help="将所有受支持源码送入模型；用于小型深度审计或基准，显著增加耗时。",
+    )
+    parser.add_argument(
+        "--generate-repairs",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="为风险结论生成模型补丁（默认开启；广覆盖检测基准可使用 --no-generate-repairs）。",
+    )
+    parser.add_argument(
+        "--repair-manual-review",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="为待人工复核项生成补丁（默认开启；可用 --no-repair-manual-review 降低延迟）。",
+    )
+    parser.add_argument("--no-cache", action="store_true", help="禁用内容寻址的增量扫描缓存。")
+    parser.add_argument("--cache-dir", default=CACHE_DIRECTORY, help="增量扫描缓存目录。")
+    parser.add_argument(
+        "--verify-patches",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="在临时项目副本中验证模型补丁并输出 diff（默认开启，不修改源码）。",
+    )
+    parser.add_argument(
+        "--patch-test-command",
+        action="append",
+        default=[],
+        help="在隔离副本中执行的显式回归命令，可重复传入；不会通过 shell 执行。",
+    )
+    parser.add_argument(
+        "--patch-test-timeout",
+        type=int,
+        default=30,
+        help="每条补丁语法/回归命令的超时秒数。",
+    )
+    parser.add_argument(
+        "--allow-remote-model",
+        action="store_true",
+        help="显式允许非回环 Ollama 端点；默认严格离线并拒绝远端模型。",
+    )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {SCANNER_VERSION}")
+    return parser
+
+
+def main(argv=None):
+    global REMOTE_MODEL_ALLOWED, STATIC_ONLY, FORCE_DEEP_SCAN_ALL, GENERATE_REPAIRS, REPAIR_MANUAL_REVIEW
+    args = build_argument_parser().parse_args(argv)
+    REMOTE_MODEL_ALLOWED = bool(args.allow_remote_model)
+    STATIC_ONLY = bool(args.static_only)
+    FORCE_DEEP_SCAN_ALL = bool(args.deep_all)
+    GENERATE_REPAIRS = bool(args.generate_repairs)
+    REPAIR_MANUAL_REVIEW = bool(args.repair_manual_review)
+    target_directory = os.path.abspath(os.path.expanduser(args.target))
+    run_id = _new_run_id()
+    output_directory = (
+        os.path.abspath(os.path.expanduser(args.output_dir))
+        if args.output_dir
+        else os.path.join(RUNS_DIRECTORY, run_id)
+    )
+    report_path = (
+        os.path.abspath(os.path.expanduser(args.report))
+        if args.report
+        else os.path.join(output_directory, "report.md")
+    )
+
+    if not os.path.isdir(target_directory):
+        print(f"{Colors.RED}目标目录不存在: {target_directory}{Colors.RESET}")
+        return 2
+    manifest_path = os.path.join(output_directory, "manifest.json")
+    initial_manifest = {
+        "schema_version": "awdp-run-manifest-v1",
+        "run_id": run_id,
+        "status": "starting",
+        "started_at_utc": _utc_timestamp(),
+        "scanner_version": SCANNER_VERSION,
+        "scanner_revision": _git_revision(),
+        "target": target_directory,
+        "configuration": {
+            "static_only": args.static_only,
+            "deep_all": args.deep_all,
+            "generate_repairs": args.generate_repairs,
+            "repair_manual_review": args.repair_manual_review,
+            "rag_disabled": args.no_rag,
+            "cache_disabled": args.no_cache,
+            "remote_model_allowed": args.allow_remote_model,
+        },
+    }
+    atomic_write_json(manifest_path, initial_manifest)
+    if not args.static_only and not check_ollama_status(allow_remote_model=args.allow_remote_model):
+        atomic_write_json(
+            manifest_path,
+            {**initial_manifest, "status": "failed", "completed_at_utc": _utc_timestamp(), "error": "model preflight failed"},
+        )
+        return 1
+
+    vector_db = None if args.no_rag or args.static_only else init_vector_db(DB_DIRECTORY)
+    scan_cache = None if args.no_cache else ScanCache(args.cache_dir)
+    patch_test_commands = [
+        shlex.split(command, posix=os.name != "nt") for command in args.patch_test_command if command.strip()
+    ]
+    try:
+        scan_directory(
+            target_directory,
+            vector_db=vector_db,
+            report_path=report_path,
+            findings_path=os.path.join(output_directory, "findings.json"),
+            sarif_path=os.path.join(output_directory, "results.sarif"),
+            manifest_path=manifest_path,
+            run_id=run_id,
+            scan_cache=scan_cache,
+            verify_patches=args.verify_patches,
+            patches_dir=os.path.join(output_directory, "patches"),
+            patch_test_commands=patch_test_commands,
+            patch_test_timeout=max(1, args.patch_test_timeout),
+        )
+    except Exception as exc:
+        atomic_write_json(
+            manifest_path,
+            {
+                **initial_manifest,
+                "status": "failed",
+                "completed_at_utc": _utc_timestamp(),
+                "error": f"{type(exc).__name__}: {exc}",
+            },
+        )
+        print(f"{Colors.RED}扫描失败: {exc}{Colors.RESET}")
+        return 1
+    return 0
+
+
 if __name__ == "__main__":
-    if not check_ollama_status():
-        raise SystemExit(1)
-
-    vector_db = init_vector_db(DB_DIRECTORY)
-    if not os.path.isdir(TARGET_DIRECTORY):
-        print(f"{Colors.RED}目标目录不存在: {TARGET_DIRECTORY}{Colors.RESET}")
-        raise SystemExit(1)
-
-    scan_directory(TARGET_DIRECTORY, vector_db=vector_db)
+    raise SystemExit(main())

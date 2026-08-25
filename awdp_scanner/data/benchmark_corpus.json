@@ -1,0 +1,62 @@
+{
+  "schema_version": "awdp-benchmark-corpus-v1",
+  "cases": [
+    {
+      "id": "command-direct",
+      "files": {
+        "app.py": "import os\nfrom flask import request\n\ndef route():\n    command = request.args.get('command')\n    return os.system(command)\n"
+      },
+      "expected_families": ["command_injection"]
+    },
+    {
+      "id": "command-cross-file-wrapper",
+      "files": {
+        "helpers.py": "import subprocess\n\ndef run_command(value):\n    return subprocess.run(value, shell=True)\n",
+        "app.py": "from helpers import run_command\nfrom flask import request\n\ndef route():\n    command = request.args.get('command')\n    return run_command(command)\n"
+      },
+      "expected_families": ["command_injection"]
+    },
+    {
+      "id": "ssrf-direct",
+      "files": {
+        "proxy.py": "import requests\nfrom flask import request\n\ndef proxy():\n    url = request.args.get('url')\n    return requests.get(url)\n"
+      },
+      "expected_families": ["ssrf"]
+    },
+    {
+      "id": "sqli-f-string",
+      "files": {
+        "users.py": "from flask import request\n\ndef user(cursor):\n    value = request.args.get('id')\n    query = f'SELECT * FROM users WHERE id = {value}'\n    return cursor.execute(query)\n"
+      },
+      "expected_families": ["sqli"]
+    },
+    {
+      "id": "deserialize-pickle",
+      "files": {
+        "state.py": "import pickle\nfrom flask import request\n\ndef state():\n    raw = request.data\n    return pickle.loads(raw)\n"
+      },
+      "expected_families": ["deserialization"]
+    },
+    {
+      "id": "safe-parameterized-sql",
+      "files": {
+        "users.py": "from flask import request\n\ndef user(cursor):\n    value = request.args.get('id')\n    return cursor.execute('SELECT * FROM users WHERE id = ?', (value,))\n"
+      },
+      "expected_families": []
+    },
+    {
+      "id": "safe-subprocess-list",
+      "files": {
+        "echo.py": "import subprocess\nfrom flask import request\n\ndef echo():\n    value = request.args.get('value')\n    return subprocess.run(['echo', value], shell=False)\n"
+      },
+      "expected_families": []
+    },
+    {
+      "id": "safe-no-candidate",
+      "files": {
+        "math.py": "def add(a, b):\n    return a + b\n"
+      },
+      "expected_families": []
+    }
+  ]
+}

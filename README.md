@@ -1,77 +1,155 @@
-# 🛡️ AWDP Pro Scanner 
+# AWDP Scanner
 
-面向 AWDP / 线下断网防守场景的**本地 AI 代码审计与自动修补辅助引擎**。
+面向 CTF AWD/AWDP 防守场景的离线优先源码审计与补丁验证工具。它用于赛前加固、开局审计和人工修复决策，不提供攻击自动化、flag 获取、持久化或破坏能力。
 
-本项目摒弃了传统的纯正则扫描或纯丢给大模型的低效做法，采用 **`静态规则预筛 -> LLM 深度判定 -> RAG 知识库修复约束`** 的三段式架构。旨在高压比赛开局的 15 分钟内，快速定位高价值风险，并生成**不破坏 SLA、可直接复制粘贴**的防御代码。
+核心原则是：静态分析提供事实路径，LLM 处理难以建模的语义，RAG 只约束修复策略，补丁必须在隔离副本中验证，任何失败都不能被包装成“安全”。
 
-## ✨ 核心特性
+## 当前能力
 
-- **🔌 100% 离线运行**：所有大模型推理（Ollama）和 RAG 向量检索（Chroma）均在本地完成，专为断网环境打造。
-- **🎯 极低误报率**：通过 AST 与正则预筛，准确识别 `$map[$key]` 等白名单安全写法，压制大模型的幻觉误报。
-- **🧠 动态 RAG 修复约束**：内置 AWDP 实战知识库，基于语义向量检索，强制大模型输出带有“最小权限、白名单、参数化”等约束的实战级补丁。
-- **⚡ 战术级终端大屏**：消除一切噪音日志，提供一行一文件的极简状态输出，防守局势一目了然。
+- Python 项目级 AST、调用图、跨文件参数传播和 source→sink 程序切片。
+- PHP、JavaScript/Node、Java/JSP、Go 的保守规则候选与未知来源高危 sink 提醒。
+- Ollama JSON Schema 检测/修复输出；格式错误自动转人工复核。
+- 默认仅允许回环 Ollama，禁用环境代理和重定向；远端模型必须显式授权。
+- Chroma 本地 RAG，支持 family/语言/角色元数据、混合重排、来源多样性和版本哈希。
+- Markdown、JSON、SARIF、run manifest、内容寻址增量缓存。
+- 在临时项目副本中应用候选补丁，执行语法检查和显式配置的回归命令，原源码不被修改。
+- 确定性回归基准、pytest、Ruff、CodeQL、依赖审计、SBOM 与发布构建工作流。
 
----
+## 结论语义
 
-## 📂 核心目录结构
+| 状态 | 含义 | 操作 |
+|---|---|---|
+| `VULN` | 达到明确疑似阈值 | 优先人工确认并修复 |
+| `WARN` | 证据存在但需人工复核，或模型/验证失败安全降级 | 检查 source→sink 路径和上下文 |
+| `SAFE` | 已完成相应分析并得到安全结论 | 仍不代表整个项目无漏洞 |
+| `NO-CANDIDATE` | 预筛未命中，未执行深度模型分析 | 不是安全证明 |
+| `NOT-ANALYZED` | 文件读取、分析器或执行流程失败 | 必须补扫 |
 
-```text
-├── awdp_pro_scanner.py          # 🚀 主审计扫描引擎
-├── build_vector_db.py           # 📚 本地知识库向量化构建脚本
-├── wp_knowledge/                # 🛡️ 修复约束知识库（支持动态扩充 Markdown）
-├── models/                      # 🧠 本地 Embedding 模型目录（需提前下载）
-├── chroma_db/                   # 🗄️ 向量库目录（由构建脚本自动生成）
-├── target_code/                 # 🎯 待审计的目标靶机源码目录
-└── requirements.txt             # 📦 依赖清单
-```
+特别注意：`NO-CANDIDATE` 与 `SAFE` 被严格分离；解析失败、模型失败、Schema 失败和工具失败均不会返回安全。
 
----
+## 安装
 
-## 🚀 快速开始
+Python 3.10 或更新版本：
 
-### 1. 环境准备 (赛前外网环境执行)
-
-安装 Python 依赖（推荐使用虚拟环境）：
 ```bash
-pip install -r requirements.txt
+python -m venv .venv
+source .venv/bin/activate  # Windows: .venv\Scripts\activate
+python -m pip install -e .
 ```
 
-安装并启动本地大模型（默认依赖 Ollama）：
+启用本地向量知识库：
+
 ```bash
-# 请确保本地 Ollama 已启动，并且已拉取目标代码审计模型
-ollama run qwen2.5-coder:14b
+python -m pip install -e ".[rag]"
 ```
-*(注：需自行准备好 HuggingFace 的 Embedding 模型放到 `models/` 目录下。)*
 
-### 2. 构建本地防守知识库 (赛前或比赛中途执行)
+开发环境：
 
-如果你修改或新增了 `wp_knowledge/` 目录下的 Markdown 修复规则，请务必运行此命令刷新本地向量库：
+```bash
+python -m pip install -e ".[dev]"
+```
+
+## 离线准备
+
+1. 在可信联网环境中安装依赖、Ollama 模型和 embedding 模型。
+2. 把 embedding 模型完整放入 `models/<模型名>/`，不要依赖运行时下载。
+3. 保持 `OLLAMA_BASE_URL=http://localhost:11434`。
+4. 构建知识库：
+
 ```bash
 python build_vector_db.py
 ```
 
-### 3. 启动实战扫描 (断网环境执行)
+知识库先写入临时目录，生成标签、chunk、语料和 embedding SHA-256 元数据，再事务式切换；失败时旧库保持不变。
 
-将靶机源码放入目标目录（或在 `.env` 中修改 `TARGET_DIRECTORY` 路径），然后一键启动：
+## 扫描
+
 ```bash
-python awdp_pro_scanner.py
+awdp-scanner --target /path/to/target
 ```
 
----
+常用选项：
 
-## 🖥️ 战术面板判读指南
+```bash
+awdp-scanner \
+  --target /path/to/target \
+  --output-dir ./awdp_runs/opening-scan \
+  --no-rag \
+  --no-cache \
+  --verify-patches
+```
 
-扫描启动后，终端将进入极简汇报模式。请安全队员根据前方图标快速采取行动：
+需要测量模型本身的条件能力时，可用 `--deep-all` 跳过候选门控；只做检测、不消耗第二次模型调用生成修复时，可加 `--no-generate-repairs`。这两个选项适合评测和人工控制的深审，不应被理解为所有文件都能得到可靠结论。
 
-- `[✅ SAFE]`：模型或规则判定该处代码上下文安全（如已存在完善的过滤/参数化），**无需理会**。
-- `[🚨 VULN]`：明确存在高危漏洞。**请立即打开生成的 Markdown 报告，复制 `🟢 修复代码` 打补丁**。
-- `[⚠️ WARN]`：引擎发现可疑 Sink 点，但由于代码过于复杂无法 100% 确认。**需分配队员人工复核**。
+只有在操作者明确授权执行目标项目测试时，才传入回归命令：
 
-扫描结束后，引擎会在根目录生成详细的 `awdp_pro_report.md`，其中包含了具体的漏洞链路归因和修复建议代码。
+```bash
+awdp-scanner --target ./target_code \
+  --patch-test-command "python -m pytest -q" \
+  --patch-test-timeout 60
+```
 
----
+目标仓库测试属于不可信代码。这个选项不提供 OS 级沙箱；正式比赛环境应在无网络、无凭据、低权限的容器或虚拟机中运行整个扫描器。
 
-## ⚠️ AWDP 实战注意事项
+每次运行默认写入唯一的 `awdp_runs/<run-id>/`：
 
-1. **绝对不要盲目全盘替换**：工具生成的补丁极度贴合安全标准，但在极少数涉及复杂框架自定义驱动（如魔改的 DB 类）时，可能出现依赖偏差。请在应用补丁前肉眼核对原变量名。
-2. **跨文件链路协同**：若报告中出现了“跨文件风险（如反序列化的 Reader/Writer）”，请务必确保读写两端同步修改，否则会导致靶机服务 500 掉线（SLA 扣分）。
+```text
+report.md          人工阅读报告
+findings.json      结构化完整结果
+results.sarif      GitHub/IDE/安全平台交换格式
+manifest.json      配置、版本、哈希、摘要、缓存和补丁验证记录
+patches/*.diff     隔离验证过或验证失败的候选差异
+```
+
+## 严格离线边界
+
+- 默认只接受 `localhost`、`127.0.0.0/8` 和 `::1` 模型端点。
+- HTTP 会话 `trust_env=False`，不继承代理或隐式认证，并拒绝重定向。
+- embedding 加载必须支持 `local_files_only=True`；不兼容时失败关闭。
+- `--allow-remote-model` 是显式数据外传授权，使用前应确认比赛规则和源码保密要求。
+
+## 架构
+
+```text
+安全发现 → 语言规则/AST → 项目调用图与污点传播 → 程序切片
+        → LLM Schema 判定 → RAG 修复约束 → 候选补丁
+        → 临时副本验证 → Markdown/JSON/SARIF/manifest
+```
+
+实现已拆分为 `awdp_scanner.analysis`、`models`、`reporters`、`cache`、`patching`、`rag` 和 `benchmark`。详细信任边界见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) 与 [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md)。
+
+## 基准与质量门槛
+
+```bash
+ruff check .
+python -m pytest -q
+awdp-benchmark --corpus benchmarks/corpus.json --output benchmark-result.json
+python -m build
+```
+
+仓库内置基准是小型确定性回归集，用于防止已知能力倒退，不能外推为真实世界准确率。严肃评测应采用去重、按时间切分的 vulnerable/fixed 对、跨文件变形测试和固定人工复核预算。研究依据见 [`docs/RESEARCH_FOUNDATIONS.md`](docs/RESEARCH_FOUNDATIONS.md)。
+
+真实 Ollama/硬件基准使用固定提交、逐文件 SHA-256 校验的 Probely CTF 子集。首次显式下载语料：
+
+```bash
+awdp-model-benchmark --prepare \
+  --model qwen2.5-coder:14b \
+  --output-dir benchmarks/.results/qwen14b
+```
+
+后续运行去掉 `--prepare` 即保持离线；可用多个 `--model` 比较模型，或用多个 `--case <id>` 做定向实验。该工具只读取题目源码，不启动题目、不执行 PoC 或目标测试。当前实机结果、Intel Arc Vulkan 配置和指标解释见 [`docs/REAL_MODEL_BENCHMARK_2026-08-25.md`](docs/REAL_MODEL_BENCHMARK_2026-08-25.md)。
+
+## 已知边界
+
+- “完美扫描器”不存在；未命中不等于无漏洞。
+- 当前一等语义前端是 Python；其他语言仍以保守规则和人工复核为主。
+- Python 分析目前是上下文不敏感、有限控制流合并，不处理反射、运行时 monkey patch、C 扩展和所有框架隐式数据流。
+- 模型 `confidence` 不是校准后的真实概率。
+- 语法通过不代表补丁功能正确；只有显式功能/安全回归也通过时，补丁证据才更强。
+- 本项目不是恶意代码沙箱，扫描和目标测试应由外部容器/VM 隔离。
+
+## 安全与发布
+
+漏洞报告方式见 [`SECURITY.md`](SECURITY.md)，贡献规则见 [`CONTRIBUTING.md`](CONTRIBUTING.md)，发布前检查见 [`docs/RELEASE_CHECKLIST.md`](docs/RELEASE_CHECKLIST.md)。
+
+仓库目前没有明确软件许可证。许可证是仓库所有者的法律选择；在许可证确定前，不应把代码视为已获开放源代码再分发授权。

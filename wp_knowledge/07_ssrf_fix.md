@@ -29,19 +29,32 @@
 - 只修某个请求入口而不修公共请求库，会在其他入口保留同类 SSRF 风险。
 
 ## 最小修补示例
-项目级主线示例（推荐）：
+仅在业务必须访问任意公网主机时使用的校验骨架（推荐优先采用业务域名白名单）：
 ```python
-u = urlparse(url)
-if u.scheme not in ("http", "https"):
+import ipaddress
+import socket
+from urllib.parse import urlsplit
+
+u = urlsplit(url)
+if u.scheme not in {"http", "https"} or not u.hostname or u.username or u.password:
     raise ValueError("bad scheme")
-host_ip = ipaddress.ip_address(socket.gethostbyname(u.hostname))
-if host_ip.is_private or host_ip.is_loopback or host_ip.is_link_local:
+if u.port not in {None, 80, 443}:
+    raise ValueError("bad port")
+resolved = {
+    ipaddress.ip_address(item[4][0])
+    for item in socket.getaddrinfo(u.hostname, u.port or 443, type=socket.SOCK_STREAM)
+}
+if not resolved or any(not address.is_global for address in resolved):
     raise ValueError("internal blocked")
+# HTTP 客户端必须关闭自动重定向；每次重定向都重新执行同一校验。
+# 生产环境还应由出口代理/防火墙执行相同白名单，避免校验与连接间 DNS 重绑定。
 ```
 
 ## 不推荐做法
 - 不要只做字符串 `contains("127.0.0.1")` 这类拦截。
 - 不要忽略 DNS 解析后的真实 IP。
+- 不要只检查一次 DNS 后再让客户端重新解析连接；校验与连接必须绑定，并在出口层兜底。
+- 不要自动跟随重定向；若业务确需重定向，每一跳都要重新校验协议、端口、主机与全部解析 IP。
 - 不要把所有请求都改成固定 URL，导致业务不可用。
 
 ## 检索关键词

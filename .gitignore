@@ -8,6 +8,16 @@ __pycache__/
 chroma_db/
 target_code/
 awdp_pro_report.md
+awdp_runs/
+.awdp_cache/
+benchmarks/.external/
+benchmarks/.results/
+.tmp-dist/
+.tmp-dist-*/
+.tmp-venv/
+.tmp-venv-*/
+build/
+*.egg-info/
 
 # 本地大模型与向量模型
 models/

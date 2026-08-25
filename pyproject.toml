@@ -1,0 +1,61 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "awdp-scanner"
+version = "0.2.0"
+description = "Offline-first defensive source scanner for AWD/AWDP competitions"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "python-dotenv>=1.0,<2.0",
+  "requests>=2.31,<3.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/wuliangqi9-hue/AWDP-scanner"
+Source = "https://github.com/wuliangqi9-hue/AWDP-scanner"
+Issues = "https://github.com/wuliangqi9-hue/AWDP-scanner/issues"
+
+[project.optional-dependencies]
+rag = [
+  "langchain-chroma>=1.0,<2.0",
+  "langchain-community>=0.4,<1.0",
+  "langchain-huggingface>=1.0,<2.0",
+  "langchain-text-splitters>=1.0,<2.0",
+]
+dev = [
+  "build>=1.2,<2",
+  "pytest>=9,<10",
+  "ruff>=0.15,<1",
+]
+
+[project.scripts]
+awdp-scanner = "awdp_pro_scanner:main"
+awdp-benchmark = "awdp_scanner.benchmark:main"
+awdp-model-benchmark = "awdp_scanner.model_benchmark:main"
+
+[tool.setuptools]
+py-modules = ["awdp_pro_scanner", "build_vector_db"]
+
+[tool.setuptools.packages.find]
+include = ["awdp_scanner*"]
+
+[tool.setuptools.package-data]
+awdp_scanner = ["data/*.json"]
+
+[tool.setuptools.data-files]
+"share/awdp-scanner/wp_knowledge" = ["wp_knowledge/*.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+ignore = ["E501"]

@@ -33,8 +33,12 @@
 项目级主线示例（最终态推荐）：
 ```php
 $base = realpath('/var/www/data');
+if ($base === false) {
+    throw new RuntimeException('base directory unavailable');
+}
 $target = realpath($base . '/' . $name);
-if ($target === false || strpos($target, $base) !== 0) {
+$prefix = rtrim($base, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR;
+if ($target === false || !str_starts_with($target, $prefix)) {
     http_response_code(403);
     exit;
 }
@@ -47,6 +51,7 @@ if ($target === false || strpos($target, $base) !== 0) {
 
 ## 边界场景提醒
 - 有 `realpath` 不等于一定安全，必须校验归一化后的目标路径是否仍在基准目录内。
+- 目录前缀必须带路径分隔符；否则 `/var/www/data-evil` 会错误匹配 `/var/www/data`。
 - `basename` 只能减小风险，不等于完整修复。
 - 编码转换前后都要看最终目标路径，不要只校验原始输入串。
 - 黑名单 `../` 过滤不能替代最终路径归一化校验。

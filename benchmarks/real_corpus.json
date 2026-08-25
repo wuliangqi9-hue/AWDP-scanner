@@ -1,0 +1,107 @@
+{
+  "schema_version": "awdp-real-model-corpus-v1",
+  "dataset": {
+    "name": "Probely CTF Challenges pinned subset",
+    "repository": "https://github.com/Probely/CTF-Challenges",
+    "commit": "4f5d17a20ac16eebda41144dc33f5f3b7c02cf68",
+    "license": "Apache-2.0",
+    "license_url": "https://github.com/Probely/CTF-Challenges/blob/4f5d17a20ac16eebda41144dc33f5f3b7c02cf68/LICENSE",
+    "scope": "Eight real CTF challenge projects. Source is downloaded only by an explicit --prepare flag and is never executed."
+  },
+  "cases": [
+    {
+      "id": "probely-highway-display",
+      "title": "Pixels Camp 2016 Highway Display",
+      "expected_families": ["deserialization"],
+      "evidence_files": ["app.py"],
+      "negative_files": ["protocol.py"],
+      "patch_benchmark": true,
+      "files": [
+        {"remote_path": "Pwnable/100-HighwayDisplay/src/app.py", "local_path": "app.py", "sha256": "5e9d2133ea8949d4d55db87c634e841dc431b713457c816af8cf453a3c1b6698"},
+        {"remote_path": "Pwnable/100-HighwayDisplay/src/protocol.py", "local_path": "protocol.py", "sha256": "51a2c790a7c4c42e78b1d77d1f2125cdbf478f43ffb0ff6153b46598eed544c9"}
+      ]
+    },
+    {
+      "id": "probely-rolodex",
+      "title": "Pixels Camp 2016 Rolodex",
+      "expected_families": ["auth"],
+      "evidence_files": ["app.py"],
+      "negative_files": [],
+      "patch_benchmark": false,
+      "files": [
+        {"remote_path": "WebHacking/100-Rolodex/src/app.py", "local_path": "app.py", "sha256": "adb0218f1fa3078bd028d14513ed205612c315c69fde30ed69a9bcd5c6422e2f"}
+      ]
+    },
+    {
+      "id": "probely-get-the-list",
+      "title": "Pixels Camp 2017 Get The List",
+      "expected_families": ["sqli"],
+      "evidence_files": ["app.py"],
+      "negative_files": [],
+      "patch_benchmark": true,
+      "files": [
+        {"remote_path": "WebHacking/200-GetTheList/src/app.py", "local_path": "app.py", "sha256": "4d191f0840b316c0959af6de413d1a936e6a6d2fdb0d40f3d5eaf508bfd7629d"}
+      ]
+    },
+    {
+      "id": "probely-regain-session",
+      "title": "Pixels Camp Regain Session",
+      "expected_families": ["auth"],
+      "evidence_files": ["app.py", "static/user.service.js"],
+      "negative_files": [],
+      "patch_benchmark": false,
+      "files": [
+        {"remote_path": "WebHacking/200-RegainSession/src/app.py", "local_path": "app.py", "sha256": "6b9801e38d5c53398e349ab32f4eda2b5146521f70bb75c124b18107ca1b82a3"},
+        {"remote_path": "WebHacking/200-RegainSession/src/static/app-services/user.service.js", "local_path": "static/user.service.js", "sha256": "7ffae6abbd72ec49fed4c1e13b6717fb5f46add5d0ec1757cb4b590f8da07683"}
+      ]
+    },
+    {
+      "id": "probely-from-user-to-admin",
+      "title": "Pixels Camp 2016 From User To Admin",
+      "expected_families": ["auth"],
+      "evidence_files": ["authentication.py", "crypto.py"],
+      "negative_files": ["app.py"],
+      "patch_benchmark": false,
+      "files": [
+        {"remote_path": "Pwnable/200-FromUserToAdmin/src/app.py", "local_path": "app.py", "sha256": "352e174732e20927181a702cb611782420719328cc3edc941171ce74d5c09cc7"},
+        {"remote_path": "Pwnable/200-FromUserToAdmin/src/authentication.py", "local_path": "authentication.py", "sha256": "c6507c687159335eb68e9bbed3e0b17a32ab5a19b0cc2167bf63eef12624307d"},
+        {"remote_path": "Pwnable/200-FromUserToAdmin/src/crypto.py", "local_path": "crypto.py", "sha256": "55ed01eb7db6a81f6cc83173031360e6985b88b74a2986e485575b7a0d3d5826"}
+      ]
+    },
+    {
+      "id": "probely-read-email",
+      "title": "Pixels Camp 2016 Read Email",
+      "expected_families": ["auth"],
+      "evidence_files": ["views.py"],
+      "negative_files": [],
+      "patch_benchmark": false,
+      "files": [
+        {"remote_path": "Pwnable/200-ReadEmail/app/views.py", "local_path": "views.py", "sha256": "e497cadba45ec9fcf82ce1b29e86d7428908f5f586399cec02e8ec710d17c128"}
+      ]
+    },
+    {
+      "id": "probely-bad-plugin",
+      "title": "Pixels Camp 2016 Bad Plugin",
+      "expected_families": ["upload"],
+      "evidence_files": ["upload.php"],
+      "negative_files": ["myplugin.php"],
+      "patch_benchmark": true,
+      "files": [
+        {"remote_path": "WebHacking/100-BadPlugin/docroot/upload.php", "local_path": "upload.php", "sha256": "1a877d918ed99f99d00b642c284bb792ee12cab52116e6978ffbc30ae2e3ba57"},
+        {"remote_path": "WebHacking/100-BadPlugin/docroot/myplugin.php", "local_path": "myplugin.php", "sha256": "e78ce638f0ab0256a5b037d021178fa6a1440d89941ab74c9d43b7177d1483e4"}
+      ]
+    },
+    {
+      "id": "probely-i-need-monies",
+      "title": "Pixels Camp 2016 I Need Monies",
+      "expected_families": ["xxe", "ssrf"],
+      "evidence_files": ["operations.php"],
+      "negative_files": ["index.php"],
+      "patch_benchmark": true,
+      "files": [
+        {"remote_path": "WebHacking/400-INeedMonies/app/operations.php", "local_path": "operations.php", "sha256": "0bcb3bc2cf7b4fbaf252246c3a1e0d6ae1fcbb2c036bc14db305722018bf205f"},
+        {"remote_path": "WebHacking/400-INeedMonies/app/index.php", "local_path": "index.php", "sha256": "83c908a3b3d74811422dd32fa20413ce07a2a7f52ac939e71d7dc0015c89f2bd"}
+      ]
+    }
+  ]
+}
